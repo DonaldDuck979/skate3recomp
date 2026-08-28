@@ -500,6 +500,32 @@ bool ReadEntityWorldRows(uint8_t* base, uint32_t ctx, float out_rows[12]) {
          ReadWorldRowsChecked(base, info.entity, out_rows);
 }
 
+bool ReadPrimarySkaterWorld(uint8_t* base, float out_rows[12], uint32_t* out_entity) {
+  // Pick the most-bound view-live skater-family entity. In free-roam there is
+  // one player skater; when several skater entities are live (menus, create-a-
+  // skater) the most-drawn one is the best available "local player" guess.
+  uint32_t best = 0;
+  uint64_t best_binds = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    for (const auto& [ent, rec] : g_entities) {
+      const bool skater = rec.cls == EntClass::kSkater ||
+                          rec.cls == EntClass::kColorized ||
+                          rec.cls == EntClass::kCac ||
+                          rec.cls == EntClass::kSkaterAux;
+      if (!skater || rec.view_refs <= 0) continue;
+      if (best == 0 || rec.bind_count >= best_binds) {
+        best_binds = rec.bind_count;
+        best = ent;
+      }
+    }
+  }
+  if (best == 0) return false;
+  if (!ReadWorldRowsChecked(base, best, out_rows)) return false;
+  if (out_entity) *out_entity = best;
+  return true;
+}
+
 bool ReadSkaterFade(uint8_t* base, uint32_t ctx, float* out_alpha) {
   if (!REXCVAR_GET(skate3_native_render_scene_entity_fade_serve)) {
     return false;
@@ -706,6 +732,14 @@ void EmitStats() {
       g_wserve_nomode.exchange(0, std::memory_order_relaxed),
       g_wprim.exchange(0, std::memory_order_relaxed),
       g_wprim_div.exchange(0, std::memory_order_relaxed));
+}
+
+bool ReadEntityWorldRowsByEntity(uint8_t* base, uint32_t entity,
+                                 float out_rows[12]) {
+  if (entity == 0) {
+    return false;
+  }
+  return ReadWorldRowsChecked(base, entity, out_rows);
 }
 
 }  // namespace skate3::native_entity

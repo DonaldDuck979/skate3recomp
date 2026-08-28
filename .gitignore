@@ -35,3 +35,14 @@ CMakeUserPresets.json
 
 # Local developer scripts (texture decoding, extraction, bootstrap helpers)
 /scripts/
+
+# --- Online fork additions (extra hygiene) ---
+# Built runtime library (product of the rexglue-sdk submodule)
+*.dll
+# Retail Title Update package (game data -- provide your own)
+TU_*
+# Local profile/save data
+/profiles/
+/B13E*/
+# Stray GPU vendor cache folder
+/NVIDIA Corporation/

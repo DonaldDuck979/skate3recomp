@@ -11,7 +11,7 @@ if(SKATE3_STATIC_MSVC_RUNTIME)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-project(skate3 VERSION 2.0.0 LANGUAGES CXX)
+project(skate3 VERSION 2.0.0 LANGUAGES C CXX)
 
 if(WIN32)
     enable_language(RC)
@@ -239,6 +239,36 @@ endif()
 include(cmake/RexGlue.cmake)
 include(cmake/CodegenTargets.cmake)
 
+# Fan-made online play: vendored ENet transport (see third_party/enet/LICENSE).
+add_subdirectory(third_party/enet)
+
+option(SKATE3_BUILD_NET_TESTS "Build standalone Skate 3 network integration tests" OFF)
+
+if(SKATE3_BUILD_NET_TESTS)
+    add_executable(skate3_net_session_test
+        src/net/skate3_net_serialize.cpp
+        src/net/skate3_net_session.cpp
+        src/net/tests/skate3_net_session_test.cpp
+    )
+    target_include_directories(skate3_net_session_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/net
+    )
+    target_link_libraries(skate3_net_session_test PRIVATE enet)
+    target_compile_features(skate3_net_session_test PRIVATE cxx_std_23)
+endif()
+
+# Headless online relay: a dedicated, render/input-free hub (reuses the exact
+# net session code). Lets everyone connect OUT to one public box (e.g. a VPS)
+# so no player has to port-forward. Standalone; not part of the game build.
+add_executable(skate3_relay
+    src/net/skate3_net_serialize.cpp
+    src/net/skate3_net_session.cpp
+    src/net/relay/skate3_relay_main.cpp
+)
+target_include_directories(skate3_relay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/net)
+target_link_libraries(skate3_relay PRIVATE enet)
+target_compile_features(skate3_relay PRIVATE cxx_std_23)
+
 set(SKATE3_COMMON_SOURCES
     src/exception_compat.cpp
     src/skate3_app_common.cpp
@@ -251,6 +281,9 @@ set(SKATE3_COMMON_SOURCES
     src/native/skate3_native_guest_read.cpp
     src/native/skate3_native_lw.cpp
     src/native/skate3_native_palette.cpp
+    src/net/skate3_net_serialize.cpp
+    src/net/skate3_net_session.cpp
+    src/net/skate3_net_system.cpp
     src/skate3_native_debug_dialog.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp
@@ -285,7 +318,12 @@ if(WIN32)
         ${CMAKE_CURRENT_BINARY_DIR}/skate3.rc
         @ONLY
     )
-    target_sources(skate3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/skate3.rc)
+    # [skate3-online patch] rc.exe fails under clang/ninja (cmake_llvm_rc passes
+    # -MD/-MF -> fatal RC1107); the version resource is cosmetic DLL/EXE metadata.
+    # Skip it in this toolchain (same as the rexglue SDK does for its .rc files).
+    if(NOT (CMAKE_RC_COMPILER MATCHES "rc.exe$" AND CMAKE_GENERATOR MATCHES "Ninja"))
+        target_sources(skate3 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/skate3.rc)
+    endif()
 else()
     add_executable(skate3 ${SKATE3_SOURCES})
 endif()
@@ -354,7 +392,7 @@ else()
     message(STATUS "generated/eawebkit/sources.cmake not found; run the generate-all target before building skate3")
 endif()
 
-target_link_libraries(skate3 PRIVATE rex::runtime)
+target_link_libraries(skate3 PRIVATE rex::runtime enet)
 rexglue_configure_target(skate3)
 
 if(APPLE)

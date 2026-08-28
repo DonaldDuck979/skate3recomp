@@ -44,6 +44,14 @@ class RenderModeIndicator final : public rex::ui::ImGuiDialog {
  protected:
   bool WantsContinuousRepaint() const override { return false; }
   void OnDraw(ImGuiIO& io) override;
+
+ private:
+  // [online play] Draws the net diagnostics overlay when online play is active.
+  void DrawNetOverlay(ImGuiIO& io);
+  // [S.K.A.T.E.] Bottom-left panel: a circle with a right-stick flick-path
+  // arrow for the SET trick, plus the trick name. Mirrors L/R by the local
+  // stance (skate3_stance cvar) so goofy/regular players both see it right.
+  void DrawSetTrickHowTo(ImGuiIO& io, const std::string& trick);
 };
 
 }  // namespace skate3

@@ -2,6 +2,7 @@
 
 #include "skate3_demo_path.h"
 #include "skate3_fov.h"
+#include "net/skate3_net_system.h"
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
 #include "skate3_native_scene.h"
@@ -749,6 +750,9 @@ void Skate3BaseApp::OnPostSetup() {
   ApplySelectedProfileToRuntime();
   ApplyGameplayCursorMode();
 
+  // Fan-made online play (opt-in via skate3_net_enable). No-op otherwise.
+  skate3::net::Skate3NetInitialize();
+
   if (auto* input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system())) {
     input_system->SetActiveCallback([this]() {
       const bool settings_visible = simple_settings_dialog_ && simple_settings_dialog_->visible();
@@ -814,6 +818,7 @@ void Skate3BaseApp::OnPostSetup() {
 }
 
 void Skate3BaseApp::OnShutdown() {
+  skate3::net::Skate3NetShutdown();
   rex::ui::UnregisterBind("bind_skate3_menu");
   rex::ui::UnregisterBind("bind_skate3_menu_alt");
   rex::ui::UnregisterBind("bind_skate3_save_draw_fingerprints");
@@ -921,11 +926,66 @@ void Skate3BaseApp::ToggleSimpleSettings() {
     }
     return pad;
   };
+  // Online play (fan-made). The dialog edits the skate3_net_* cvars itself; these
+  // hooks report live status for the readout and start/stop the session when the
+  // player activates Host / Join / Disconnect in the Online category.
+  auto online_status = []() -> rex::ui::SimpleSettingsOnlineStatus {
+    namespace net = skate3::net;
+    rex::ui::SimpleSettingsOnlineStatus s;
+    const net::NetStatus st = net::Skate3Net().Status();
+    s.active = st.active;
+    if (!st.active) {
+      s.state_line = "offline";
+      return s;
+    }
+    const char* mode = st.mode == net::SessionMode::kHost     ? "hosting"
+                       : st.mode == net::SessionMode::kClient ? "joining"
+                                                              : "online";
+    const char* state = st.state == net::SessionState::kConnected      ? "connected"
+                        : st.state == net::SessionState::kConnecting   ? "connecting"
+                        : st.state == net::SessionState::kFailed       ? "failed"
+                        : st.state == net::SessionState::kDisconnected ? "disconnected"
+                                                                       : "idle";
+    s.state_line = std::string(mode) + " (" + state + ")";
+    if (!st.last_error.empty()) {
+      s.detail_line = "error: " + st.last_error;
+    } else if (st.peer_count > 0) {
+      s.detail_line = std::to_string(st.peer_count) +
+                      (st.peer_count == 1 ? " player connected" : " players connected");
+    } else if (st.mode == net::SessionMode::kHost) {
+      s.detail_line = "waiting for a player";
+    }
+    return s;
+  };
+  auto online_connect = []() { skate3::net::Skate3NetConnect(); };
+  auto online_disconnect = []() { skate3::net::Skate3NetDisconnect(); };
+  // Party (v4). Read-only view for the Party menu tab; actions are driven via
+  // one-shot cvars (skate3_party_invite / _accept / _leave / _private) which
+  // the game consumes each frame -- the menu doesn't need a write callback.
+  auto party_status = []() -> rex::ui::SimpleSettingsPartyView {
+    namespace net = skate3::net;
+    rex::ui::SimpleSettingsPartyView out;
+    const net::PartyView pv = net::Skate3Net().GetPartyView();
+    out.in_party = pv.in_party;
+    out.is_private = pv.is_private;
+    out.you_are_leader = pv.you_are_leader;
+    out.leader_name = pv.leader_name;
+    for (const net::PartyMember& m : pv.members) {
+      rex::ui::SimpleSettingsPartyMember o;
+      o.name = m.name;
+      o.leader = m.leader;
+      o.local = m.local;
+      out.members.push_back(std::move(o));
+    }
+    for (const net::PartyInviteEntry& ie : pv.invites) out.invites.push_back(ie.from);
+    return out;
+  };
   simple_settings_dialog_ =
       std::make_unique<rex::ui::SimpleSettingsDialog>(
           imgui_drawer(), user_settings_path_, std::move(load_profiles), std::move(save_profile),
           std::move(close_settings), std::move(close_game), std::move(restart_game),
-          std::move(poll_gamepad));
+          std::move(poll_gamepad), std::move(online_status), std::move(online_connect),
+          std::move(online_disconnect), std::move(party_status));
   ApplySettingsCursorMode();
   skate3::native_scene::SetSettingsMenuBlur(true);
   simple_settings_dialog_->Show();

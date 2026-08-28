@@ -16,6 +16,8 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -62,6 +64,17 @@ REXCVAR_DEFINE_BOOL(skate3_guest_fps_cap_auto, true, "Skate 3",
                     "refresh is known.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// [skater-probe] Read-only investigation for real remote-skater entities.
+// When on, logs the first sighting of every skater-family entity the game
+// builds -- its address, class, and the guest caller that spawned it -- so we
+// can find an EA-independent skater-spawn path to reuse. Default OFF (zero
+// behavior/perf change until enabled from the ` console).
+REXCVAR_DEFINE_BOOL(skate3_skater_probe, false, "Net",
+                    "Diagnostic: log each skater entity the game constructs "
+                    "(address, class, spawn caller address) to locate a "
+                    "reusable skater-spawn path for net-driven remote skaters.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace skate3::native_render {
 namespace {
 
@@ -80,6 +93,85 @@ uint64_t g_frame_index = 0;
 std::atomic<bool> g_announced{false};
 
 bool Enabled() { return REXCVAR_GET(skate3_native_render); }
+
+
+// ---- [skater-probe] real remote-skater entity investigation ---------------
+// Read-only. Gated by skate3_skater_probe (default off). Logs each distinct
+// skater-family entity ONCE with two guest caller addresses:
+//   spawn_lr = who registered it into the render views (AddEntityToRenderViews
+//              caller) -- points into the game's own skater spawn/activation
+//              path, the function we want to reuse to build a remote skater.
+//   bind_lr  = who invoked its BindConstants (the render/bind path).
+// Open the generated code at spawn_lr to read the spawn function. The
+// caps/dedupe keep it to a short, one-time burst; nothing here changes render
+// behavior.
+std::mutex g_skater_probe_mu;
+std::unordered_map<uint32_t, uint32_t> g_skater_probe_spawn_lr;  // entity -> first view-add caller
+std::unordered_set<uint32_t> g_skater_probe_done;                // entities already logged
+int g_skater_probe_count = 0;
+
+void SkaterProbeViewAdd(uint32_t entity, uint32_t lr) {
+  if (entity == 0 || !REXCVAR_GET(skate3_skater_probe)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_skater_probe_mu);
+  if (g_skater_probe_spawn_lr.size() < 16384) {
+    // emplace keeps the FIRST registration caller = closest to spawn time.
+    g_skater_probe_spawn_lr.emplace(entity, lr);
+  }
+}
+
+void SkaterProbeBind(uint32_t entity, const char* cls, uint32_t bind_lr) {
+  if (entity == 0 || !REXCVAR_GET(skate3_skater_probe)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_skater_probe_mu);
+  if (g_skater_probe_count >= 256 || !g_skater_probe_done.insert(entity).second) {
+    return;  // logged already, or hit the one-time burst cap.
+  }
+  uint32_t spawn_lr = 0;
+  const auto it = g_skater_probe_spawn_lr.find(entity);
+  if (it != g_skater_probe_spawn_lr.end()) {
+    spawn_lr = it->second;
+  }
+  ++g_skater_probe_count;
+  REXLOG_INFO(
+      "[skater-probe] #{} entity={:08X} class={} spawn_lr={:08X} bind_lr={:08X}",
+      g_skater_probe_count, entity, cls, spawn_lr, bind_lr);
+}
+
+// [skater-probe] Every ~3 s, dump the world position of each known skater
+// entity. If they cluster at one point they are the player at multiple
+// LOD/passes; if they sit at distinct points (or the origin), some are
+// separate/dormant skater entities we could drive directly. Gated on the
+// probe cvar; read-only (native_entity::ReadEntityWorldRowsByEntity reads
+// entity+416).
+void SkaterProbeRoster(uint8_t* base) {
+  if (!REXCVAR_GET(skate3_skater_probe)) {
+    return;
+  }
+  static std::chrono::steady_clock::time_point s_last{};
+  const auto now = std::chrono::steady_clock::now();
+  if (s_last.time_since_epoch().count() != 0 &&
+      std::chrono::duration<double>(now - s_last).count() < 3.0) {
+    return;
+  }
+  s_last = now;
+  std::vector<uint32_t> roster;
+  {
+    std::lock_guard<std::mutex> lock(g_skater_probe_mu);
+    roster.assign(g_skater_probe_done.begin(), g_skater_probe_done.end());
+  }
+  for (uint32_t e : roster) {
+    float rows[12];
+    if (skate3::native_entity::ReadEntityWorldRowsByEntity(base, e, rows)) {
+      REXLOG_INFO("[skater-roster] entity={:08X} pos=({:.1f},{:.1f},{:.1f})", e,
+                  rows[3], rows[7], rows[11]);
+    } else {
+      REXLOG_INFO("[skater-roster] entity={:08X} (no world / dormant)", e);
+    }
+  }
+}
 
 
 void OnRenderMesh(uint8_t* base, uint32_t mesh_context, uint32_t vertex_program_state,
@@ -534,6 +626,11 @@ extern "C" REX_FUNC(sub_82785778) {
 // scene-membership/lifetime signal (native/skate3_native_entity.h).
 extern "C" REX_FUNC(sub_827A6C50) {
   const uint32_t entity = ctx.r4.u32;
+  // [skater-probe] ctx.lr here is the game code that registered this entity
+  // into the render views -- its spawn/activation path. Self-gated on the
+  // probe cvar; records the caller for every entity, resolved to a skater at
+  // bind time.
+  skate3::native_render::SkaterProbeViewAdd(entity, ctx.lr);
   if (skate3::native_render::Enabled()) {
     skate3::native_entity::OnEntityViewAdd(entity);
   }
@@ -567,38 +664,47 @@ extern "C" REX_FUNC(sub_827A6658) {
 // last tag to land is the entity's concrete class.
 extern "C" REX_FUNC(sub_82783D68) {  // Sk8::SkaterPresEntity
   const uint32_t entity = ctx.r3.u32;
+  const uint32_t caller_lr = ctx.lr;
   __imp__sub_82783D68(ctx, base);
   if (skate3::native_render::Enabled()) {
     skate3::native_entity::OnBindClass(
         entity, skate3::native_entity::EntClass::kSkater);
   }
+  skate3::native_render::SkaterProbeBind(entity, "skater", caller_lr);
+  skate3::native_render::SkaterProbeRoster(base);
 }
 
 extern "C" REX_FUNC(sub_82785260) {  // ColorizedSkaterPresEntity
   const uint32_t entity = ctx.r3.u32;
+  const uint32_t caller_lr = ctx.lr;
   __imp__sub_82785260(ctx, base);
   if (skate3::native_render::Enabled()) {
     skate3::native_entity::OnBindClass(
         entity, skate3::native_entity::EntClass::kColorized);
   }
+  skate3::native_render::SkaterProbeBind(entity, "colorized", caller_lr);
 }
 
 extern "C" REX_FUNC(sub_82793F70) {  // CACPresEntity (untransposed world)
   const uint32_t entity = ctx.r3.u32;
+  const uint32_t caller_lr = ctx.lr;
   __imp__sub_82793F70(ctx, base);
   if (skate3::native_render::Enabled()) {
     skate3::native_entity::OnBindClass(
         entity, skate3::native_entity::EntClass::kCac);
   }
+  skate3::native_render::SkaterProbeBind(entity, "cac", caller_lr);
 }
 
 extern "C" REX_FUNC(sub_82785528) {  // unnamed skater-layout class
   const uint32_t entity = ctx.r3.u32;
+  const uint32_t caller_lr = ctx.lr;
   __imp__sub_82785528(ctx, base);
   if (skate3::native_render::Enabled()) {
     skate3::native_entity::OnBindClass(
         entity, skate3::native_entity::EntClass::kSkaterAux);
   }
+  skate3::native_render::SkaterProbeBind(entity, "skater-aux", caller_lr);
 }
 
 extern "C" REX_FUNC(sub_827C1720) {  // cLivingWorldPresEntity

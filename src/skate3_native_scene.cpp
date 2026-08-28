@@ -17,6 +17,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <deque>
 #include <ctime>
 #include <filesystem>
@@ -34,10 +35,12 @@
 #include <rex/cvar.h>
 #include <rex/graphics/native_guest_renderer.h>
 #include <rex/kernel/guest_presence.h>
+#include <rex/kernel/xam/input_injection.h>
 #include <rex/logging.h>
 
 #include "native/skate3_native_diag.h"
 #include "native/skate3_native_entity.h"
+#include "net/skate3_net_system.h"
 #include "native/skate3_native_guest_read.h"
 #include "native/skate3_native_lw.h"
 #include "native/skate3_native_palette.h"
@@ -71,6 +74,225 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_scene_lightmaps, true, "Skate 3",
                     "lightmap x2 at the |uv2| unwrap reproduces the emulated baked "
                     "sun/shadow/AO structure), and the texture payload revalidation "
                     "re-decodes pages that were captured before composition.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_net_render_remote_skaters, true, "Net",
+                    "Render driven remote-skater meshes in the native scene "
+                    "renderer (clone + retarget the local player's scene "
+                    "items onto each remote's sampled root pose). Independent "
+                    "kill switch from skate3_net_enable for bring-up.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_net_replicate_bones, true, "Net",
+                    "A1 full-body replication: drive each cloned remote mesh from "
+                    "the peer's per-mesh palette, paired by CONTENT ID (ib_count) "
+                    "so meshes can't be mismatched. Each mesh with no match falls "
+                    "back to the pose-mirror (never explodes). Off = pure mirror.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [net-real] Represent each remote player with a REAL game skater entity
+// (own model + board + the game's own animation) instead of the local-player
+// mesh clone. Hijacks one of the game's ambient AI skaters per remote peer and
+// positions it at the remote's synced net position each frame. When ON, the
+// clone-injection path is skipped for remotes. Default OFF (the proven clone
+// path stays the default until this is validated live).
+REXCVAR_DEFINE_BOOL(skate3_net_real_skaters, false, "Net",
+                    "Drive each remote player as a REAL ambient skater entity "
+                    "(own model/board/animation), positioned at the remote's "
+                    "net position, instead of the mesh clone. Off = clone path.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [skater-puppet] Proof-of-concept for driving a REAL game skater entity.
+// The game already spawns+animates a crowd of ambient AI skaters (each a real
+// SkaterPresEntity, own model + own animation, no EA backend). When on, this
+// picks one ambient skater (not the player) and relocates its already-
+// submitted draw items to beside the player every frame -- purely host-side
+// (offsets scene.items bones like the remote-clone bridge), NO guest-memory
+// writes. If a real, self-animating skater appears next to the player, driving
+// a real entity is proven -> the path to real remote skaters with their own
+// models. Off = no effect.
+REXCVAR_DEFINE_BOOL(skate3_skater_puppet, false, "Net",
+                    "Debug PoC: relocate one ambient AI skater beside the "
+                    "player each frame (host-side item offset) to prove a real "
+                    "skater entity can be driven. Off = no effect.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_skater_puppet_offset, 5.0, "Net",
+                      "Sideways distance (world units, +X) to place the puppet "
+                      "skater from the player for skate3_skater_puppet.")
+    .range(-1000.0, 1000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [score-scan] Debug tool to LOCATE the game's live score in guest memory
+// (foundation for online game modes / score tracking). Open the console (`)
+// and type `skate3_score_scan <the number shown on the HUD>`. First set = full
+// scan; each later set with a new HUD value NARROWS the candidates. Repeat over
+// a few tricks until it reports 1 address (logged as [score-scan] cand). Set
+// skate3_score_scan_reset 1 to start over. Results go to the log + console.
+REXCVAR_DEFINE_DOUBLE(skate3_score_scan, 0.0, "Net",
+                      "Debug: set to the current on-screen score to scan/narrow "
+                      "guest memory for the score address. 0 = idle.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_score_scan_reset, false, "Net",
+                    "Debug: set 1 to clear the score-scan candidate set (fresh scan).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_score_watch_addr, 0.0, "Net",
+                      "Debug: once the score address is known, set this to that "
+                      "guest address (decimal) to log its live value each second "
+                      "as [score-watch], confirming it tracks the HUD.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_score_scan_track, false, "Net",
+                    "Debug: after a fresh skate3_score_scan, set 1 to log (twice a "
+                    "second, as [score-track]) every current candidate whose live "
+                    "value is a plausible nonzero score -- skate/do a combo and "
+                    "read which address matches the HUD (robust to transient scores).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [trick-scan] Locate the game's CURRENT-TRICK NAME text in guest memory (the
+// HUD trick string, e.g. "Kickflip" / "Pop Shuvit" / "Frontside 360 Kickflip")
+// -- authoritative trick identity for S.K.A.T.E., including rotations, with no
+// flick-classifier guessing. Open the ` console, land a trick, and type
+// `skate3_trick_scan <exact HUD text>`. First set = full scan (ASCII + UTF-16)
+// for that text; each later set with a DIFFERENT trick's text NARROWS to the
+// address that CHANGED to the new trick = the live current-trick buffer.
+REXCVAR_DEFINE_STRING(skate3_trick_scan, "", "Net",
+                      "Debug: set to the exact on-screen trick name to scan/"
+                      "narrow guest memory for the current-trick address. "
+                      "Empty = idle.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_trick_scan_reset, false, "Net",
+                    "Debug: set 1 to clear the trick-scan candidate set (fresh scan).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_trick_watch_addr, 0.0, "Net",
+                      "Debug: once the trick-name address is known, set this to "
+                      "that guest address (decimal) to log the live string there "
+                      "each second as [trick-watch], confirming it tracks tricks.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Confirmed stable guest address of the live line/combo score (0x40210460 =
+// 1075905632; verified to track the HUD and persist across launches). Read each
+// frame and published to the net layer for game-mode scoring. Cvar so it can be
+// re-pointed if a future build shifts it. 0 = disabled.
+REXCVAR_DEFINE_DOUBLE(skate3_score_addr, 1075905632.0, "Net",
+                      "Guest address (decimal) of the live line/combo score, read "
+                      "each frame for online game-mode scoring. 0 = off.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_trick_addr, 1075062781.0, "Net",
+                      "Guest address (decimal) of the live current-trick NAME "
+                      "text (found via skate3_trick_scan; 0x401427fd), read each "
+                      "frame + broadcast for S.K.A.T.E. matching/display. 0 = off.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Runtime auto-scan for the score/trick addresses. Different TU builds or
+// heap layouts can shift them (currently defaults are James's TU3 install);
+// this scanner runs in the background and re-locks the addresses when it
+// converges. On failure the defaults keep working. Publish-critical since it
+// removes the "works on my install only" fragility for scoring/S.K.A.T.E.
+REXCVAR_DEFINE_BOOL(skate3_addr_autoscan, false, "Net",
+                    "Enable runtime auto-scan for skate3_score_addr / "
+                    "skate3_trick_addr. Default OFF -- the addresses baked in "
+                    "as defaults are confirmed on the reference TU3 install. "
+                    "Enable this only when defaults are known to shift (e.g. "
+                    "a different TU build); mis-locking to a wrong address "
+                    "was causing set tricks to display as the wrong name.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_trick_debug, false, "Net",
+                    "Log the trick-name buffer content + score + land counter "
+                    "once per second so it's visible what the game's HUD "
+                    "actually shows when a trick is landed. Default ON while "
+                    "we diagnose set-trick-wrong-name bugs; turn it off with "
+                    "`skate3_trick_debug 0` once the buffer behavior is "
+                    "confirmed. One log line per second is not noisy.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [trick-probe] Read-only memory probe to find a PER-LAND signal near the
+// trick-name buffer: a value the game updates on EVERY landed trick (even the
+// same trick twice), which the name buffer alone can't detect. Dumps the words
+// around 0x401427fd that CHANGED since the last sample; land the SAME trick a
+// few times and look for a word that ticks each land. Default ON for this
+// investigation; edge-triggered so it only logs actual changes.
+REXCVAR_DEFINE_BOOL(skate3_trick_probe, false, "Net",
+                    "Diagnostic: [trick-state] trace -- log the trick STATE word "
+                    "(trick_addr-29) + name every time either changes, so the "
+                    "spin/rotation name-finalization timing is visible. Default "
+                    "OFF; enable with `skate3_trick_probe 1` to inspect trick "
+                    "state timing.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// The per-land signal: a trick STATE word 29 bytes before the trick-name
+// buffer. It reads 0 while grounded and rises to >=2 the instant a trick is
+// LANDED (confirmed on repeated same-name tricks the name buffer can't see),
+// then returns to 0. A land edge = it rises from {0,1} into {>=2}. This is the
+// game's own trick-state machine -- reading it (not reimplementing detection)
+// is how the original online worked. When true (default), S.K.A.T.E. land
+// detection uses this edge; when false it falls back to trick-name changes
+// (which miss landing the same trick twice in a row).
+REXCVAR_DEFINE_BOOL(skate3_trick_state_edge, true, "Net",
+                    "Use the trick STATE word (trick_addr-29) rising to >=2 as "
+                    "the per-land signal for S.K.A.T.E., so landing the same "
+                    "trick twice registers. False = fall back to trick-name "
+                    "changes only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_mode_start, 0.0, "Net",
+                      "Set (from the ` console or the Online menu) to N to START a "
+                      "Spot Battle of N seconds/round for everyone in the session. "
+                      "This instance becomes the round authority; runs "
+                      "skate3_mode_rounds rounds back-to-back.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_mode_rounds, 1.0, "Net",
+                      "Number of back-to-back Spot Battle rounds (1-6) the next "
+                      "skate3_mode_start begins. Set by the Online menu's Game "
+                      "Modes tab.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_skate_start, 0.0, "Net",
+                      "Set (from the ` console) to N (1-3) to START a S.K.A.T.E. "
+                      "game of N rounds for the session. This instance becomes "
+                      "the authority (runs turns/letters). Menu-driven later.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Party (v4). The menu writes these; the game consumes them each frame and
+// clears them so the same action can fire again. Strings so the menu can pass
+// a display name directly.
+REXCVAR_DEFINE_STRING(skate3_party_invite, "", "Net",
+                      "Set to a player's display name to send them a party "
+                      "invite. Consumed by the game each frame.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(skate3_party_accept, "", "Net",
+                      "Set to an inviter's name to accept a pending party "
+                      "invite from them. Consumed by the game each frame.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_party_leave, false, "Net",
+                    "Set to true to leave the current party (become solo). "
+                    "Consumed by the game each frame.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_party_private, false, "Net",
+                    "Party privacy toggle. Leader-only: makes the party PRIVATE "
+                    "so non-party peers are hidden from your world and excluded "
+                    "from your game-mode rounds. Members inherit the leader's "
+                    "value. Consumed by the game each frame and mirrored to the "
+                    "net system.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Guest-input control (foundation for S.K.A.T.E. freeze + Spot Battle respawn).
+REXCVAR_DEFINE_BOOL(skate3_input_freeze, false, "Net",
+                    "Freeze local player input (guest sees a neutral gamepad). "
+                    "Debug/test; game modes drive this programmatically.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_input_mask, 257.0, "Net",
+                      "Button MASK injected by skate3_input_fire. Skate 3: "
+                      "return-to-marker = LB+Up = 257 (0x0101); set-marker = "
+                      "LB+Down = 258 (0x0102). (Renamed from *_reset_button: the "
+                      "cvar system mis-handled the shared *_reset prefix.)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_input_fire, 0.0, "Net",
+                      "Set 1 to inject skate3_input_mask for a few polls (default "
+                      "mask 257 = return-to-marker).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(skate3_input_hold, 20.0, "Net",
+                      "How many polls the injected button is held.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_input_log, false, "Net",
+                    "Log the gamepad state the game reads (as [input-read], "
+                    "rate-limited) -- verify input reaches the game + see the "
+                    "button mask for a combo (press LB+Up -> buttons=0x0101).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(skate3_stance, 0, "Net",
+                     "This player's board stance for S.K.A.T.E. trick detection: "
+                     "0 = goofy (default), 1 = regular. Regular mirrors the "
+                     "left/right flick (goofy kickflip = Up-Right, regular = "
+                     "Up-Left). Set per instance to match the skater's stance.")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_settle_freeze, false, "Net",
+                    "When on, FREEZE everyone once no player has moved for 5s "
+                    "(S.K.A.T.E. turn-start settle detection). Off to release.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(skate3_menu_blur_sigma, 9.0, "Skate 3",
                       "Settings-menu backdrop gaussian sigma, in 1080p pixels (matches "
@@ -8292,6 +8514,550 @@ void WidenPublishedCamera(FrameScene& scene, float scale) {
   }
 }
 
+// [online play] Column-vector affine 3x4 (m_MatLtoWTrans layout: 3 rows of
+// [R|t], row-major, translation in columns 3/7/11 -- the same layout
+// ReadPrimarySkaterWorld/MatrixRowsToQuat already use) composition helpers,
+// used to retarget a locally-posed scene item onto a remote skater's root
+// transform for driven remote-skater rendering (see the net bridge below).
+// out = a . b, i.e. out(v) = a(b(v)).
+static void ComposeAffine12(const float a[12], const float b[12], float out[12]) {
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) {
+      out[r * 4 + c] = a[r * 4 + 0] * b[0 * 4 + c] +
+                       a[r * 4 + 1] * b[1 * 4 + c] +
+                       a[r * 4 + 2] * b[2 * 4 + c];
+    }
+    out[r * 4 + 3] = a[r * 4 + 0] * b[3] + a[r * 4 + 1] * b[7] +
+                     a[r * 4 + 2] * b[11] + a[r * 4 + 3];
+  }
+}
+
+// Inverse of an orthonormal (no-scale) affine 3x4: R' = R^T, t' = -R^T * t.
+static void InvertAffine12(const float m[12], float out[12]) {
+  for (int r = 0; r < 3; ++r) {
+    for (int c = 0; c < 3; ++c) out[r * 4 + c] = m[c * 4 + r];
+  }
+  const float tx = m[3], ty = m[7], tz = m[11];
+  for (int r = 0; r < 3; ++r) {
+    out[r * 4 + 3] = -(out[r * 4 + 0] * tx + out[r * 4 + 1] * ty +
+                        out[r * 4 + 2] * tz);
+  }
+}
+
+// Quat + position -> column-vector affine 3x4 rows. Matches
+// skate3::net::MatrixRowsToQuat's convention exactly (row-major, v' = Rv,
+// translation in slots [3],[7],[11]).
+static void QuatPosToAffine12(const skate3::net::Quat& q,
+                              const skate3::net::Vec3& p, float out[12]) {
+  const float x = q.x, y = q.y, z = q.z, w = q.w;
+  out[0]  = 1.0f - 2.0f * (y * y + z * z);
+  out[1]  = 2.0f * (x * y - w * z);
+  out[2]  = 2.0f * (x * z + w * y);
+  out[3]  = p.x;
+  out[4]  = 2.0f * (x * y + w * z);
+  out[5]  = 1.0f - 2.0f * (x * x + z * z);
+  out[6]  = 2.0f * (y * z - w * x);
+  out[7]  = p.y;
+  out[8]  = 2.0f * (x * z - w * y);
+  out[9]  = 2.0f * (y * z + w * x);
+  out[10] = 1.0f - 2.0f * (x * x + y * y);
+  out[11] = p.z;
+}
+
+// Inverse of QuatPosToAffine12's rotation extraction: pull an orientation
+// quaternion out of a 3x4 affine's 3x3 rotation block (R[r][c] = rows[r*4+c]).
+// A byte-for-byte copy of skate3::net::MatrixRowsToQuat's branch form so the
+// capture side (here) and the wire/remote side agree exactly on convention;
+// assumes near-orthonormal (skater bones carry no scale) and normalizes.
+// Used by the A1 bone-replication capture below.
+static skate3::net::Quat AffineRowsToQuat(const float rows[12]) {
+  const float m00 = rows[0], m01 = rows[1], m02 = rows[2];
+  const float m10 = rows[4], m11 = rows[5], m12 = rows[6];
+  const float m20 = rows[8], m21 = rows[9], m22 = rows[10];
+  skate3::net::Quat q;
+  float trace = m00 + m11 + m22;
+  if (trace > 0.0f) {
+    float s = 0.5f / std::sqrt(trace + 1.0f);
+    q.w = 0.25f / s;
+    q.x = (m21 - m12) * s;
+    q.y = (m02 - m20) * s;
+    q.z = (m10 - m01) * s;
+  } else if (m00 > m11 && m00 > m22) {
+    float s = 2.0f * std::sqrt(1.0f + m00 - m11 - m22);
+    q.w = (m21 - m12) / s;
+    q.x = 0.25f * s;
+    q.y = (m01 + m10) / s;
+    q.z = (m02 + m20) / s;
+  } else if (m11 > m22) {
+    float s = 2.0f * std::sqrt(1.0f + m11 - m00 - m22);
+    q.w = (m02 - m20) / s;
+    q.x = (m01 + m10) / s;
+    q.y = 0.25f * s;
+    q.z = (m12 + m21) / s;
+  } else {
+    float s = 2.0f * std::sqrt(1.0f + m22 - m00 - m11);
+    q.w = (m10 - m01) / s;
+    q.x = (m02 + m20) / s;
+    q.y = (m12 + m21) / s;
+    q.z = 0.25f * s;
+  }
+  float len = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+  if (len > 1e-8f) { q.x /= len; q.y /= len; q.z /= len; q.w /= len; }
+  else { q = {0, 0, 0, 1}; }
+  return q;
+}
+
+// DrawItem::world (row-vector, translation in row 3) <-> the column-vector
+// affine 3x4 layout above. Mirrors the recipe at (see the rigid-item world
+// conversion elsewhere in this file) -- a transpose relabel, not a matrix
+// inversion, so it's exactly reversible.
+static void Affine12ToWorld16(const float rows[12], float world[16]) {
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) world[i * 4 + j] = rows[j * 4 + i];
+    world[i * 4 + 3] = 0.0f;
+    world[12 + i] = rows[i * 4 + 3];
+  }
+  world[15] = 1.0f;
+}
+static void World16ToAffine12(const float world[16], float rows[12]) {
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < 3; ++j) rows[j * 4 + i] = world[i * 4 + j];
+    rows[i * 4 + 3] = world[12 + i];
+  }
+}
+
+// [addr-autoscan] Automated background scan for the score + trick guest
+// addresses, so the recomp works on installs where the defaults don't hold.
+//
+// Strategy: locate the LIVE current-trick-name buffer by observing that only
+// the HUD's buffer flips between DIFFERENT known trick names as the player
+// tricks -- static string tables (which also contain "Ollie") never change.
+// Once the trick buffer is locked, offset arithmetic can't help score, so
+// score is found by watching for an address whose 4-byte content increases
+// over time by plausible amounts and settles in a plausible range.
+//
+// Runs entirely on the game thread inside BuildFrameScene (same guest-read
+// context as the manual scanners). Non-blocking: budgets a small work quota
+// per frame so the full heap sweep spreads across many frames without stalling.
+// A confidence-vote confirmation (kLockVotes hits) avoids one-hit false
+// positives. Never invalidates the working cvars; on failure the defaults
+// (0x401427fd trick / 0x40210460 score) keep running.
+namespace addr_autoscan {
+
+// Known common trick-name strings the game's HUD is likely to display. Order
+// doesn't matter; any known name observed at a candidate slot counts as a
+// "trick-name flip" signal. Kept short so the substring check is O(few).
+static constexpr const char* kKnownTricks[] = {
+    "Ollie",         "Kickflip",   "Heelflip",    "Nollie",     "Pop Shuvit",
+    "Varial",        "360 Flip",   "Impossible",  "Bigspin",    "Late",
+    "Bs 180",        "Fs 180",     "Bs 360",      "Fs 360",     "Manual",
+    "Nose Manual",   "5-0",        "50-50",       "Grind",      "Boardslide",
+    "Nosegrind",     "Smith",      "Feeble",      "Crooked",    "Overcrook",
+};
+constexpr size_t kMaxCandidates = 8192;   // upper bound on scan-time candidates.
+constexpr int kLockVotes = 3;             // observed flips before locking.
+
+struct State {
+  bool trick_scan_started = false;
+  bool trick_locked = false;
+  uint32_t trick_addr = 0;
+  std::vector<uint32_t> trick_cands;
+  std::string trick_last_seen[64];   // last known name per candidate (bounded).
+  std::map<uint32_t, int> trick_flip_votes;
+
+  bool score_scan_started = false;
+  bool score_locked = false;
+  uint32_t score_addr = 0;
+  std::vector<uint32_t> score_cands;
+  std::map<uint32_t, uint32_t> score_last_val;
+  std::map<uint32_t, int> score_grow_votes;
+
+  uint32_t next_action_frame = 0;   // simple frame pacer (~1 Hz).
+  uint32_t sweep_cursor = 0;         // full-scan cursor across frames.
+  uint64_t start_frame = 0;
+};
+
+static bool NameIsKnown(const char* s, size_t max_len) {
+  for (const char* k : kKnownTricks) {
+    size_t klen = std::strlen(k);
+    if (klen > max_len) continue;
+    if (std::memcmp(s, k, klen) == 0) return true;
+  }
+  return false;
+}
+
+// Reads up to 40 chars of ASCII at addr, terminates at NUL, returns length.
+static size_t ReadAsciiName(uint8_t* base, uint32_t addr, char* out, size_t cap) {
+  size_t n = 0;
+  for (; n + 1 < cap; ++n) {
+    uint8_t c = 0;
+    if (!GuestTryCopy(&c, REX_RAW_ADDR(addr + n), 1)) break;
+    if (c == 0) break;
+    if (c < 0x20 || c > 0x7E) break;
+    out[n] = static_cast<char>(c);
+  }
+  out[n] = 0;
+  return n;
+}
+
+}  // namespace addr_autoscan
+
+static void RunAddrAutoscan(uint8_t* base, uint64_t frame_number) {
+  using namespace addr_autoscan;
+  if (!REXCVAR_GET(skate3_addr_autoscan)) return;
+  static State s;
+  if (s.start_frame == 0) s.start_frame = frame_number;
+
+  // Delay ~5 seconds after boot before starting, so the game has loaded into
+  // Free Play and the HUD buffer exists (avoids scanning empty heap early).
+  if (frame_number - s.start_frame < 300) return;
+
+  // Trick auto-scan.
+  if (!s.trick_locked) {
+    if (!s.trick_scan_started) {
+      // Full-heap sweep, spread across frames (max 64 pages/frame ~= 256 KB).
+      constexpr uint32_t kBegin = 0x40000000u, kEnd = 0x50000000u;
+      constexpr uint32_t kPage = 0x1000u;
+      constexpr int kPagesPerFrame = 64;
+      if (s.sweep_cursor == 0) s.sweep_cursor = kBegin;
+      uint8_t buf[kPage];
+      int pages_done = 0;
+      while (s.sweep_cursor < kEnd && pages_done < kPagesPerFrame) {
+        if (GuestTryCopy(buf, REX_RAW_ADDR(s.sweep_cursor), kPage)) {
+          for (uint32_t o = 0; o + 6 <= kPage; ++o) {
+            // Cheap ASCII-name gate: look for 'O' 'l' 'l' 'i' 'e' + NUL/space.
+            if (buf[o] == 'O' && buf[o+1] == 'l' && buf[o+2] == 'l' &&
+                buf[o+3] == 'i' && buf[o+4] == 'e' &&
+                (buf[o+5] == 0 || buf[o+5] == ' ' || buf[o+5] == '\n')) {
+              if (s.trick_cands.size() < kMaxCandidates) {
+                s.trick_cands.push_back(s.sweep_cursor + o);
+              }
+            }
+          }
+        }
+        s.sweep_cursor += kPage;
+        ++pages_done;
+      }
+      if (s.sweep_cursor >= kEnd) {
+        s.trick_scan_started = true;
+        s.sweep_cursor = 0;
+        REXLOG_INFO("[addr-autoscan] trick sweep done: {} 'Ollie' candidates",
+                    s.trick_cands.size());
+      }
+      return;  // wait for the sweep to finish before the observe pass.
+    }
+    // Observe pass: once a second, read each candidate and check if it now
+    // holds a KNOWN trick name different from what it had last time. Static
+    // string tables never flip; the live HUD buffer does.
+    if (frame_number < s.next_action_frame) return;
+    s.next_action_frame = frame_number + 60;   // ~1 Hz.
+    char name[48];
+    int idx = 0;
+    for (auto it = s.trick_cands.begin(); it != s.trick_cands.end() && idx < 64;
+         ++it, ++idx) {
+      const uint32_t a = *it;
+      size_t n = ReadAsciiName(base, a, name, sizeof(name));
+      if (n < 4) continue;
+      if (!NameIsKnown(name, n)) continue;
+      std::string cur(name, n);
+      if (!s.trick_last_seen[idx].empty() && s.trick_last_seen[idx] != cur) {
+        int& v = s.trick_flip_votes[a];
+        ++v;
+        if (v >= kLockVotes) {
+          s.trick_locked = true;
+          s.trick_addr = a;
+          rex::cvar::SetFlagByName("skate3_trick_addr",
+                                   std::to_string(a));
+          REXLOG_INFO(
+              "[addr-autoscan] LOCKED trick addr = {:#x} ({}) after {} flips",
+              a, a, v);
+          break;
+        }
+      }
+      s.trick_last_seen[idx] = std::move(cur);
+    }
+  }
+
+  // Score auto-scan: watch for values that grow. Cheap incremental version --
+  // records the "highest-observed" 4-byte value at each of a small rotating
+  // sample of addresses in the heap and picks the one whose value has grown
+  // by many plausible bumps. Runs only after trick locks (or has been running
+  // >2 min without a lock) so we don't spread I/O over two scans at once.
+  if (!s.score_locked && s.trick_locked) {
+    // On first score-pass, seed candidates from a sample near the trick addr
+    // (score in the same game object often lives within ~1 MB). If empty,
+    // full heap sample.
+    if (!s.score_scan_started) {
+      constexpr uint32_t kRadius = 0x00100000u;   // ±1 MB around the trick addr.
+      const uint32_t lo = s.trick_addr > kRadius ? s.trick_addr - kRadius : 0x40000000u;
+      const uint32_t hi = s.trick_addr + kRadius;
+      // Sample every 16 bytes (4-byte-aligned) so the candidate set stays small.
+      for (uint32_t a = lo & ~0x3u; a < hi; a += 16) {
+        if (s.score_cands.size() >= kMaxCandidates) break;
+        s.score_cands.push_back(a);
+      }
+      s.score_scan_started = true;
+      s.next_action_frame = frame_number + 60;
+      REXLOG_INFO("[addr-autoscan] score seed: {} nearby-of-trick candidates",
+                  s.score_cands.size());
+      return;
+    }
+    if (frame_number < s.next_action_frame) return;
+    s.next_action_frame = frame_number + 60;   // ~1 Hz.
+    for (uint32_t a : s.score_cands) {
+      uint32_t w = 0;
+      if (!GuestTryLoadU32(base, a, &w)) continue;
+      // Plausible score range (0 to 100M).
+      if (w == 0 || w > 100000000u) continue;
+      auto it = s.score_last_val.find(a);
+      if (it == s.score_last_val.end()) {
+        s.score_last_val[a] = w;
+        continue;
+      }
+      const uint32_t prev = it->second;
+      const uint32_t delta = w > prev ? w - prev : 0u;
+      // Real trick bumps land between ~50 and ~5,000,000 (line multiplier).
+      if (w > prev && delta >= 50u && delta <= 5000000u) {
+        int& v = s.score_grow_votes[a];
+        ++v;
+        if (v >= kLockVotes) {
+          s.score_locked = true;
+          s.score_addr = a;
+          rex::cvar::SetFlagByName("skate3_score_addr",
+                                   std::to_string(a));
+          REXLOG_INFO(
+              "[addr-autoscan] LOCKED score addr = {:#x} ({}) after {} grows",
+              a, a, v);
+          break;
+        }
+      } else if (w < prev) {
+        // Value dropped -- not a monotonically-rising score. Penalize.
+        auto v = s.score_grow_votes.find(a);
+        if (v != s.score_grow_votes.end() && v->second > 0) --v->second;
+      }
+      it->second = w;
+    }
+  }
+}
+
+// [score-scan] Debug: locate the game's live score in guest memory by
+// value-narrowing (drive it from the ` console; see the cvar docs above). This
+// is the foundation for online game modes / score tracking. Runs on the game
+// thread inside BuildFrameScene (guest-read recovery scope active). Scans the
+// game data heap where skater/game objects live (entities observed at
+// ~0x49xxxxxx). Matches the value both as int32 and as float32.
+static void RunScoreScan(uint8_t* base) {
+  static double s_last_scan = 0.0;
+  static bool s_have = false;             // a fresh scan has been taken.
+  static bool s_reset_seen = false;
+  static std::vector<uint32_t> s_cands;   // surviving guest addresses.
+
+  // Reset (edge-triggered on the bool going true).
+  const bool reset = REXCVAR_GET(skate3_score_scan_reset);
+  if (reset && !s_reset_seen) {
+    s_cands.clear();
+    s_have = false;
+    s_last_scan = 0.0;
+    REXLOG_INFO("[score-scan] reset -- next skate3_score_scan value starts fresh");
+  }
+  s_reset_seen = reset;
+
+  // Live watch of a known address (after it's found).
+  const double watch = REXCVAR_GET(skate3_score_watch_addr);
+  if (watch > 0.0) {
+    static uint32_t s_watch_frame = 0;
+    if ((++s_watch_frame % 60) == 0) {
+      uint32_t v = 0;
+      if (GuestTryLoadU32(base, static_cast<uint32_t>(watch), &v)) {
+        float f;
+        std::memcpy(&f, &v, 4);
+        REXLOG_INFO("[score-watch] addr={:#x} int={} float={:.1f}",
+                    static_cast<uint32_t>(watch), v, f);
+      }
+    }
+  }
+
+  // Track mode: periodically print every candidate that currently holds a
+  // plausible nonzero score, so the score address reveals itself as it tracks
+  // the HUD (robust to transient/fleeting combo values that exact-narrow misses).
+  if (REXCVAR_GET(skate3_score_scan_track) && !s_cands.empty()) {
+    static uint32_t s_track_frame = 0;
+    if ((++s_track_frame % 30) == 0) {
+      int shown = 0;
+      for (uint32_t g : s_cands) {
+        uint32_t w;
+        if (!GuestTryLoadU32(base, g, &w)) continue;
+        float f;
+        std::memcpy(&f, &w, 4);
+        const bool int_ok = w > 0 && w < 100000000u;
+        const bool flt_ok = f > 0.5f && f < 1.0e8f;
+        if (!int_ok && !flt_ok) continue;
+        REXLOG_INFO("[score-track] addr={:#x} int={} float={:.1f}", g, w, f);
+        if (++shown >= 40) break;
+      }
+      if (shown == 0)
+        REXLOG_INFO("[score-track] (no candidate holds a plausible score now)");
+    }
+  }
+
+  const double v = REXCVAR_GET(skate3_score_scan);
+  if (v == 0.0 || v == s_last_scan) return;  // only act on a new nonzero value.
+  s_last_scan = v;
+
+  const uint32_t vi = static_cast<uint32_t>(static_cast<int32_t>(llround(v)));
+  const float vf = static_cast<float>(v);
+  uint32_t vfb;
+  std::memcpy(&vfb, &vf, 4);
+  auto hit = [&](uint32_t word) { return word == vi || word == vfb; };
+
+  if (!s_have) {
+    // Fresh full scan of the game data heap, in page chunks (a chunk spanning an
+    // uncommitted page just fails the copy and is skipped).
+    constexpr uint32_t kBegin = 0x40000000u, kEnd = 0x50000000u, kChunk = 0x1000u;
+    static std::vector<uint8_t> buf(kChunk);
+    s_cands.clear();
+    for (uint32_t a = kBegin; a < kEnd; a += kChunk) {
+      if (!GuestTryCopy(buf.data(), REX_RAW_ADDR(a), kChunk)) continue;
+      for (uint32_t o = 0; o + 4 <= kChunk; o += 4) {
+        uint32_t raw;
+        std::memcpy(&raw, buf.data() + o, 4);
+        if (hit(__builtin_bswap32(raw))) {
+          s_cands.push_back(a + o);
+          if (s_cands.size() >= 500000) break;
+        }
+      }
+      if (s_cands.size() >= 500000) break;
+    }
+    s_have = true;
+    REXLOG_INFO("[score-scan] fresh scan for {} -> {} candidate(s)",
+                static_cast<int32_t>(llround(v)), s_cands.size());
+  } else {
+    // Narrow: keep only candidates that now hold the new value.
+    std::vector<uint32_t> keep;
+    keep.reserve(s_cands.size());
+    for (uint32_t g : s_cands) {
+      uint32_t w;
+      if (GuestTryLoadU32(base, g, &w) && hit(w)) keep.push_back(g);
+    }
+    s_cands.swap(keep);
+    REXLOG_INFO("[score-scan] narrow to {} -> {} candidate(s)",
+                static_cast<int32_t>(llround(v)), s_cands.size());
+  }
+  const size_t n = s_cands.size() < 24 ? s_cands.size() : 24;
+  for (size_t i = 0; i < n; ++i) {
+    REXLOG_INFO("[score-scan]   cand[{}] = {:#x} ({})", i, s_cands[i], s_cands[i]);
+  }
+}
+
+// [trick-scan] Locate the live current-trick NAME string in guest memory. Scans
+// the game-data heap for the exact HUD text (ASCII and UTF-16LE); repeated with
+// a DIFFERENT trick's text, narrows to the address that CHANGED to it -- the
+// dynamic current-trick buffer (static name-table entries never change).
+static void RunTrickScan(uint8_t* base) {
+  struct Cand { uint32_t addr; bool wide; };
+  static std::string s_last;
+  static bool s_reset_seen = false;
+  static std::vector<Cand> s_cands;
+
+  const bool reset = REXCVAR_GET(skate3_trick_scan_reset);
+  if (reset && !s_reset_seen) {
+    s_cands.clear();
+    s_last.clear();
+    REXLOG_INFO("[trick-scan] reset -- next skate3_trick_scan starts fresh");
+  }
+  s_reset_seen = reset;
+
+  // Live watch of a known address (once found): log both ASCII and UTF-16 reads.
+  const double watch = REXCVAR_GET(skate3_trick_watch_addr);
+  if (watch > 0.0) {
+    static uint32_t s_wf = 0;
+    if ((++s_wf % 60) == 0) {
+      const uint32_t a = static_cast<uint32_t>(watch);
+      char ascii[64];
+      GuestTryReadString(base, a, ascii, sizeof(ascii));
+      char wide[64];
+      uint32_t wn = 0;
+      for (; wn + 1 < sizeof(wide); ++wn) {
+        uint8_t lo = 0, hi = 0;
+        if (!GuestTryCopy(&lo, REX_RAW_ADDR(a + wn * 2), 1) ||
+            !GuestTryCopy(&hi, REX_RAW_ADDR(a + wn * 2 + 1), 1) || lo == 0 ||
+            hi != 0) {
+          break;
+        }
+        wide[wn] = static_cast<char>(lo);
+      }
+      wide[wn] = 0;
+      REXLOG_INFO("[trick-watch] addr={:#x} ascii='{}' wide='{}'", a, ascii, wide);
+    }
+  }
+
+  std::string name = rex::cvar::Query<std::string>("skate3_trick_scan");
+  if (name.empty() || name == s_last) return;
+  s_last = name;
+  const size_t L = name.size();
+  if (L == 0 || L > 60) return;
+
+  if (s_cands.empty()) {
+    constexpr uint32_t kBegin = 0x40000000u, kEnd = 0x50000000u, kChunk = 0x1000u;
+    static std::vector<uint8_t> buf(kChunk + 128);
+    s_cands.clear();
+    for (uint32_t a = kBegin; a < kEnd; a += kChunk) {
+      if (!GuestTryCopy(buf.data(), REX_RAW_ADDR(a), kChunk)) continue;
+      for (uint32_t o = 0; o + L <= kChunk; ++o) {
+        if (std::memcmp(buf.data() + o, name.data(), L) == 0) {
+          s_cands.push_back({a + o, false});
+          if (s_cands.size() >= 200000) break;
+        }
+      }
+      for (uint32_t o = 0; o + L * 2 <= kChunk; ++o) {
+        bool ok = true;
+        for (size_t k = 0; k < L; ++k) {
+          if (buf[o + k * 2] != (uint8_t)name[k] || buf[o + k * 2 + 1] != 0) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
+          s_cands.push_back({a + o, true});
+          if (s_cands.size() >= 200000) break;
+        }
+      }
+      if (s_cands.size() >= 200000) break;
+    }
+    REXLOG_INFO("[trick-scan] fresh scan for '{}' -> {} candidate(s)", name,
+                s_cands.size());
+  } else {
+    std::vector<Cand> keep;
+    std::vector<uint8_t> tmp(L * 2 + 2);
+    for (const Cand& c : s_cands) {
+      bool ok = false;
+      if (!c.wide) {
+        if (GuestTryCopy(tmp.data(), REX_RAW_ADDR(c.addr), L) &&
+            std::memcmp(tmp.data(), name.data(), L) == 0) {
+          ok = true;
+        }
+      } else if (GuestTryCopy(tmp.data(), REX_RAW_ADDR(c.addr), L * 2)) {
+        ok = true;
+        for (size_t k = 0; k < L; ++k) {
+          if (tmp[k * 2] != (uint8_t)name[k] || tmp[k * 2 + 1] != 0) {
+            ok = false;
+            break;
+          }
+        }
+      }
+      if (ok) keep.push_back(c);
+    }
+    s_cands.swap(keep);
+    REXLOG_INFO("[trick-scan] narrow to '{}' -> {} candidate(s)", name,
+                s_cands.size());
+  }
+  const size_t n = s_cands.size() < 24 ? s_cands.size() : 24;
+  for (size_t i = 0; i < n; ++i) {
+    REXLOG_INFO("[trick-scan]   cand[{}] = {:#x} ({}) {}", i, s_cands[i].addr,
+                s_cands[i].addr, s_cands[i].wide ? "wide" : "ascii");
+  }
+}
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
@@ -8305,6 +9071,39 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // guest base from the very first natively rendered boot frame.
   g_guest_base.store(base, std::memory_order_relaxed);
   ++g_guest_frame;  // paces the world-item cache revalidation
+  RunScoreScan(base);  // [score-scan] debug score-locator (idle unless cvar set)
+  RunTrickScan(base);  // [trick-scan] debug current-trick-name locator
+  RunAddrAutoscan(base, g_guest_frame);  // [addr-autoscan] background score+trick lock
+  // Guest-input control layer (S.K.A.T.E. freeze + reset-to-marker injection).
+  {
+    auto& net = skate3::net::Skate3Net();
+    const bool settle = REXCVAR_GET(skate3_settle_freeze) && net.active() &&
+                        net.AllPlayersSettled(5000);
+    rex::kernel::xam::SetInputSuppressed(REXCVAR_GET(skate3_input_freeze) || settle);
+  }
+  rex::kernel::xam::SetInputLogging(REXCVAR_GET(skate3_input_log));
+  rex::kernel::xam::SetTrickStance(
+      static_cast<int>(REXCVAR_GET(skate3_stance)));
+  if (REXCVAR_GET(skate3_input_fire) > 0.0) {
+    const uint16_t mask = static_cast<uint16_t>(
+        static_cast<uint32_t>(REXCVAR_GET(skate3_input_mask)));
+    uint32_t polls = static_cast<uint32_t>(REXCVAR_GET(skate3_input_hold));
+    if (polls == 0) polls = 8;
+    // Skate 3's reset/set-marker is a COMBO (LB + D-pad) that needs an edge: LB
+    // held FIRST, then the D-pad pressed while LB is down. So inject the LB
+    // modifier alone first, THEN the full mask -- recreating a real press.
+    rex::kernel::xam::SyntheticInputStep steps[2];
+    steps[0].buttons = static_cast<uint16_t>(mask & 0x0100u);  // LB (0 if none).
+    steps[0].poll_count = 15;  // hold LB well before adding the D-pad edge.
+    steps[0].left_trigger = 0;
+    steps[0].right_trigger = 0;
+    steps[1].buttons = mask;                                   // full combo.
+    steps[1].poll_count = polls;
+    steps[1].left_trigger = 0;
+    steps[1].right_trigger = 0;
+    rex::kernel::xam::QueueSyntheticInputSequence(steps, 2);
+    rex::cvar::SetFlagByName("skate3_input_fire", "0");  // one-shot.
+  }
   // Perf telemetry: guest frame interval + this frame's capture-hook cost.
   static PerfClock::time_point s_last_frame_tp{};
   // Previous frame's phase costs, for the slow-frame attribution below (a
@@ -9684,6 +10483,843 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
                                              CharFadeAlpha(item));
     }
     skate3::native_entity::EmitStats();
+
+    // [skater-puppet] PoC: prove a real ambient skater can be driven. Host-side
+    // only -- reindex this frame's skater-family items by owning entity, pick a
+    // non-player skater, and shift its skinned items' bones by a world delta so
+    // the whole animated body sits beside the player. No guest writes.
+    if (REXCVAR_GET(skate3_skater_puppet)) {
+      std::unordered_map<uint32_t, std::vector<size_t>> skater_items;
+      std::unordered_map<uint32_t, uint32_t> owner_hist;
+      for (size_t i = 0; i < scene.items.size(); ++i) {
+        const DrawItem& item = scene.items[i];
+        if (item.ctx == 0) continue;
+        skate3::native_entity::CtxInfo info;
+        if (!skate3::native_entity::LookupCtx(item.ctx, &info)) continue;
+        if (info.cls != skate3::native_entity::EntClass::kSkater &&
+            info.cls != skate3::native_entity::EntClass::kColorized &&
+            info.cls != skate3::native_entity::EntClass::kCac &&
+            info.cls != skate3::native_entity::EntClass::kSkaterAux) {
+          continue;
+        }
+        ++owner_hist[info.entity];
+        if (item.skinned) skater_items[info.entity].push_back(i);
+      }
+      uint32_t player = 0, best_n = 0;
+      for (const auto& [ent, n] : owner_hist) {
+        if (n > best_n) { best_n = n; player = ent; }
+      }
+      float prow[12];
+      if (player != 0 &&
+          skate3::native_entity::ReadEntityWorldRowsByEntity(base, player,
+                                                             prow)) {
+        // Keep the same puppet across frames while it is still drawn (avoids
+        // flickering between different ambient skaters); else pick the
+        // non-player skater with the most skinned items.
+        static uint32_t s_puppet = 0;
+        if (s_puppet == player || skater_items.find(s_puppet) == skater_items.end()) {
+          s_puppet = 0;
+          size_t pn = 0;
+          for (const auto& [ent, idxs] : skater_items) {
+            if (ent != player && idxs.size() > pn) { pn = idxs.size(); s_puppet = ent; }
+          }
+        }
+        const double off = REXCVAR_GET(skate3_skater_puppet_offset);
+        if (s_puppet != 0) {
+          const std::vector<size_t>& idxs = skater_items[s_puppet];
+          const DrawItem& ref = scene.items[idxs[0]];
+          if (ref.bones.size() >= 12) {
+            const float dx = (prow[3] + float(off)) - ref.bones[3];
+            const float dy = prow[7] - ref.bones[7];
+            const float dz = prow[11] - ref.bones[11];
+            for (size_t idx : idxs) {
+              DrawItem& it = scene.items[idx];
+              for (size_t b = 0; b + 12 <= it.bones.size(); b += 12) {
+                it.bones[b + 3] += dx;
+                it.bones[b + 7] += dy;
+                it.bones[b + 11] += dz;
+              }
+            }
+            static int s_log = 0;
+            if ((++s_log % 120) == 0) {
+              REXLOG_INFO(
+                  "[skater-puppet] player={:08X} puppet={:08X} skinned_items={} "
+                  "delta=({:.1f},{:.1f},{:.1f})",
+                  player, s_puppet, idxs.size(), dx, dy, dz);
+            }
+          }
+        } else {
+          static int s_log2 = 0;
+          if ((++s_log2 % 120) == 0) {
+            REXLOG_INFO("[skater-puppet] player={:08X} but no other skater to "
+                        "puppet this frame", player);
+          }
+        }
+      }
+    }
+
+    // [online play] Once-per-frame network bridge (opt-in; no-op when the net
+    // system is inactive). Capture the local player's skater world transform
+    // and publish it, then sample interpolated remote skaters for rendering.
+    auto& net = skate3::net::Skate3Net();
+    if (net.active()) {
+      // [online play] Select the local player's skater as the entity that owns
+      // the most skater-family DrawItems in THIS frame's scene, and read its
+      // world transform. Two-peer capture proved the game keeps a rotating
+      // pool of skater-family presentation entities; the resident player
+      // rebinds its shader constants rarely, so a bind_count-ranked pick
+      // (ReadPrimarySkaterWorld) locks onto NON-drawing pool entities -- which
+      // both despawns the retarget clone (that entity owns no items this frame)
+      // and broadcasts a stale pool transform (the remote sees a glitchy path).
+      // The entity actually drawing the most skater items is the stable,
+      // correct anchor for both the send and the render.
+      static uint32_t s_sticky_entity = 0;
+      static float s_last_rows[12];
+      static bool s_have_last_rows = false;
+
+      uint32_t skater_entity = 0;
+      {
+        std::unordered_map<uint32_t, uint32_t> owner_hist;
+        for (const DrawItem& item : scene.items) {
+          if (item.ctx == 0) continue;
+          skate3::native_entity::CtxInfo info;
+          if (!skate3::native_entity::LookupCtx(item.ctx, &info)) continue;
+          if (info.cls == skate3::native_entity::EntClass::kSkater ||
+              info.cls == skate3::native_entity::EntClass::kColorized ||
+              info.cls == skate3::native_entity::EntClass::kCac ||
+              info.cls == skate3::native_entity::EntClass::kSkaterAux) {
+            ++owner_hist[info.entity];
+          }
+        }
+        uint32_t best = 0, best_n = 0;
+        for (const auto& [ent, n] : owner_hist) {
+          if (n > best_n) {
+            best = ent;
+            best_n = n;
+          }
+        }
+        // Hysteresis: keep the previous anchor while it still holds within one
+        // item of the max, so the pick does not flicker between two co-drawn
+        // player entities (which would jitter the broadcast transform).
+        if (s_sticky_entity != 0) {
+          const auto it = owner_hist.find(s_sticky_entity);
+          if (it != owner_hist.end() && it->second + 1 >= best_n) {
+            best = s_sticky_entity;
+          }
+        }
+        if (best_n > 0) {
+          s_sticky_entity = best;
+          skater_entity = best;
+        }
+      }
+
+      // World rows for the chosen entity. Fallbacks (last known-good pose, then
+      // the old bind_count heuristic) keep the position broadcast alive through
+      // an occasional frame that draws no skater items.
+      float skater_rows[12];
+      bool have_local = false;
+      if (skater_entity != 0 &&
+          skate3::native_entity::ReadEntityWorldRowsByEntity(
+              base, skater_entity, skater_rows)) {
+        have_local = true;
+      } else if (s_have_last_rows) {
+        std::memcpy(skater_rows, s_last_rows, sizeof(skater_rows));
+        have_local = true;
+      } else {
+        uint32_t fb_entity = 0;
+        have_local = skate3::native_entity::ReadPrimarySkaterWorld(
+            base, skater_rows, &fb_entity);
+        if (have_local && skater_entity == 0) skater_entity = fb_entity;
+      }
+      if (have_local) {
+        std::memcpy(s_last_rows, skater_rows, sizeof(skater_rows));
+        s_have_last_rows = true;
+        net.CaptureLocalFromWorldRows(skater_rows);
+
+        // Publish the live line/combo score (read from the confirmed stable
+        // guest address) for online game-mode scoring (Spot Battle etc.).
+        const uint32_t score_addr =
+            static_cast<uint32_t>(REXCVAR_GET(skate3_score_addr));
+        if (score_addr != 0) {
+          uint32_t sc = 0;
+          if (GuestTryLoadU32(base, score_addr, &sc) && sc < 100000000u) {
+            net.SetLocalScore(sc);
+          }
+        }
+
+        // Publish the live current-trick NAME (exact game HUD text) for
+        // S.K.A.T.E. matching + display, from the confirmed trick buffer.
+        const uint32_t trick_addr =
+            static_cast<uint32_t>(REXCVAR_GET(skate3_trick_addr));
+        static std::string s_last_published_trick;
+        if (trick_addr != 0) {
+          char tn[48];
+          GuestTryReadString(base, trick_addr, tn, sizeof(tn));
+          std::string tname(tn);
+          // Strip low-ASCII / non-printable padding on BOTH sides so a game
+          // buffer that briefly contains stray bytes doesn't match falsely.
+          auto is_pad = [](unsigned char c) {
+            return c <= 0x20 || c == 0x7F;
+          };
+          while (!tname.empty() && is_pad(tname.back())) tname.pop_back();
+          size_t front = 0;
+          while (front < tname.size() && is_pad(tname[front])) ++front;
+          if (front) tname.erase(0, front);
+          // Track the raw buffer name locally (auto-stance reads this); the
+          // NET trick is published only at the LAND, as the combined name.
+          s_last_published_trick = tname;
+          // Land detection uses the game's own trick STATE word (trick_addr-29):
+          // 0 grounded, 1 pop, 2/4 landed. A land = it returns to grounded (0)
+          // after being non-zero. The game shows the trick name in STAGES over
+          // the airtime -- the BASE flip first (first state=2), then the
+          // ROTATION (BS 360 etc.) -- and only the rotation survives at
+          // grounding. So we capture the base at the first state=2, the final
+          // name at grounding, and COMBINE them into the full trick (base +
+          // rotation number), matching how the original online named tricks
+          // ("Nollie" + "360" = "Nollie 360").
+          static std::string s_prev_buffer;
+          static uint32_t s_local_land_seq = 0;
+          static uint32_t s_prev_state = 0;
+          static std::string s_trick_base;   // base flip captured at first state=2.
+          static bool s_seen_landed = false;  // hit >=2 yet this trick?
+          bool landed = false;
+          const char* how = "";
+          bool state_ok = false;
+          if (REXCVAR_GET(skate3_trick_state_edge)) {
+            uint32_t state_now = 0;
+            // State word sits 29 bytes before the name buffer (same struct);
+            // derive it from trick_addr so it tracks any address change.
+            // Plausible states are small (0,1,2,4); a wild read means the
+            // address is wrong -- ignore it and let the name fallback run.
+            if (GuestTryLoadU32(base, trick_addr - 29u, &state_now) &&
+                state_now <= 64u) {
+              state_ok = true;
+              // [trick-state] frame-by-frame trace: log whenever the state OR
+              // the name changes, so the exact evolution during a spin (when
+              // the rotation degree gets appended vs when the state drops) is
+              // visible. Off by default; enable with `skate3_trick_probe 1`.
+              if (REXCVAR_GET(skate3_trick_probe)) {
+                static uint32_t s_dbg_state = 999;
+                static std::string s_dbg_name;
+                if (state_now != s_dbg_state || tname != s_dbg_name) {
+                  REXLOG_INFO("[trick-state] state={} name='{}'", state_now, tname);
+                  s_dbg_state = state_now;
+                  s_dbg_name = tname;
+                }
+              }
+              // Trick start (leaving the ground): reset the base capture.
+              if (s_prev_state == 0u && state_now != 0u) {
+                s_seen_landed = false;
+                s_trick_base.clear();
+              }
+              // First time in the "landed/committed" zone (>=2) this trick: the
+              // name here is the BASE flip (e.g. 'Pop Shuvit', 'Kickflip',
+              // 'Ollie') -- before the rotation stages overwrite it.
+              if (state_now >= 2u && !s_seen_landed && !tname.empty()) {
+                s_seen_landed = true;
+                s_trick_base = tname;
+              }
+              // Land = the state returns to FULLY GROUNDED (0) after being
+              // non-zero (the mid-trick dip to 1 is NOT a land). By grounding
+              // the name has finalized to the rotation; we combine base+rotation
+              // below.
+              if (s_prev_state != 0u && state_now == 0u && s_seen_landed) {
+                landed = true;
+                how = "state";
+              }
+              s_prev_state = state_now;
+            }
+          }
+          // Name-change fallback: ONLY when the state edge isn't available
+          // (disabled or the read failed). Not combined with a good state read,
+          // so a state land + a near-simultaneous name change can't double-count.
+          if (!state_ok && !tname.empty() && tname != s_prev_buffer) {
+            landed = true;
+            how = "name";
+          }
+          if (landed) {
+            // Combine the base flip with the rotation into the full trick name.
+            // The game shows the base flip first, then (for a body spin) a BARE
+            // rotation ("BS 360", "FS Cab 540") that overwrites it at grounding.
+            // So: if the FINAL name is a bare rotation, prepend the base flip
+            // and append the rotation's number ("Pop Shuvit" + "540"). Otherwise
+            // the final name is the game's OWN complete trick verdict (a named
+            // flip, a grab combo, etc.) -- use it as-is (prevents mashing a
+            // stale base onto an unrelated final, e.g. "360 Hardflip 180" when
+            // the game already said "Nollie Kickflip 180").
+            const std::string& fin = tname;           // finalized name at land.
+            // A "bare rotation" = every token is a spin direction word or a
+            // number, with at least one number (BS 360, FS Cab 540, 360).
+            auto is_bare_rotation = [](const std::string& s) -> bool {
+              bool has_num = false;
+              size_t i = 0;
+              while (i < s.size()) {
+                while (i < s.size() && s[i] == ' ') ++i;
+                size_t a = i;
+                while (i < s.size() && s[i] != ' ') ++i;
+                if (i == a) break;
+                const std::string tok = s.substr(a, i - a);
+                bool all_digit = !tok.empty();
+                for (char c : tok) if (c < '0' || c > '9') { all_digit = false; break; }
+                if (all_digit) { has_num = true; continue; }
+                if (tok != "FS" && tok != "BS" && tok != "Cab" &&
+                    tok != "Half-Cab" && tok != "Frontside" && tok != "Backside")
+                  return false;   // a real trick word -> not a bare rotation
+              }
+              return has_num;
+            };
+            auto trailing_number = [](const std::string& s) -> std::string {
+              size_t i = s.size();
+              while (i > 0 && s[i - 1] >= '0' && s[i - 1] <= '9') --i;
+              return (i < s.size()) ? s.substr(i) : std::string();
+            };
+            std::string combined;
+            if (is_bare_rotation(fin) && !s_trick_base.empty() &&
+                s_trick_base != fin) {
+              const std::string num = trailing_number(fin);
+              if (s_trick_base == "Ollie" || s_trick_base == "Air") {
+                combined = fin;   // ollie spin: rotation name stands alone.
+              } else {
+                // flip / nollie + body spin -> "<base> <number>"
+                combined = num.empty() ? s_trick_base : (s_trick_base + " " + num);
+              }
+            } else {
+              combined = fin;     // the game's own complete trick name.
+            }
+            ++s_local_land_seq;
+            REXLOG_INFO("[trick-land] local #{} '{}' (base='{}' final='{}')",
+                        s_local_land_seq, combined, s_trick_base, fin);
+            net.RegisterLocalLand(combined);
+          }
+          s_prev_buffer = tname;
+
+          // Diagnostic: once per second, dump exactly what the game's HUD
+          // trick buffer holds at the currently configured trick_addr, plus
+          // the score. When a set/match registers the wrong trick name, this
+          // reveals whether the buffer content is wrong (game or address
+          // issue) or the counter/adjudication is wrong.
+          if (REXCVAR_GET(skate3_trick_debug)) {
+            static uint64_t s_last_debug_frame = 0;
+            if (g_guest_frame - s_last_debug_frame >= 60) {
+              s_last_debug_frame = g_guest_frame;
+              const uint32_t sa = static_cast<uint32_t>(
+                  REXCVAR_GET(skate3_score_addr));
+              uint32_t score_now = 0;
+              if (sa != 0) GuestTryLoadU32(base, sa, &score_now);
+              REXLOG_INFO(
+                  "[trick-debug] trick_addr={:#x} content='{}' score_addr={:#x} "
+                  "score={} land_seq={}",
+                  trick_addr, tname, sa, score_now, s_local_land_seq);
+            }
+          }
+
+          // (The old changed-words memory-window probe was removed -- the
+          // per-land signal was found; the [trick-state] trace above is the
+          // active diagnostic now, gated by the same skate3_trick_probe cvar.)
+        }
+
+        // Auto-stance: correlate the game's newly-reported flip family
+        // against the raw last-flick sign to figure out this player's stance
+        // without asking. See kernel/xam GetLastFlick() for the source.
+        {
+          static uint64_t s_last_seen_flick_seq = 0;
+          static int s_stance_vote = 0;          // + = goofy, - = regular.
+          static bool s_stance_locked = false;
+          rex::kernel::xam::LastFlickSnapshot fs =
+              rex::kernel::xam::GetLastFlick();
+          if (!s_stance_locked && fs.gesture_seq != s_last_seen_flick_seq &&
+              fs.have_flick) {
+            s_last_seen_flick_seq = fs.gesture_seq;
+            // Only families we can actually cross-check (kickflip vs heelflip).
+            // Ollie / Nollie / straight-up = ambiguous; ignore. Rotations still
+            // count -- "360 Flip" / "Varial Kickflip" etc. all contain "flip".
+            const std::string& t = s_last_published_trick;
+            const bool has_kick = t.find("Kickflip") != std::string::npos ||
+                                  t.find("360 Flip") != std::string::npos;
+            const bool has_heel = t.find("Heelflip") != std::string::npos;
+            const int32_t abs_rx = fs.flick_rx < 0 ? -fs.flick_rx : fs.flick_rx;
+            if ((has_kick || has_heel) && !(has_kick && has_heel) &&
+                abs_rx > 8000) {
+              // Goofy expectation: kickflip = flick RIGHT (rx>0), heelflip = LEFT.
+              // Regular is mirrored. So if we observe (flick_right, kickflip) -> goofy vote;
+              // (flick_right, heelflip) -> regular vote; and vice versa for flick_left.
+              const bool flick_right = fs.flick_rx > 0;
+              const bool goofy_matches =
+                  (flick_right && has_kick) || (!flick_right && has_heel);
+              s_stance_vote += goofy_matches ? +1 : -1;
+              // After a clear consensus (3+ agreeing votes), lock and set the
+              // cvar. The 3-vote threshold keeps us from flipping on a single
+              // misread of the game's buffer.
+              if (s_stance_vote >= 3 || s_stance_vote <= -3) {
+                const int chosen = s_stance_vote > 0 ? 0 : 1;   // 0=goofy, 1=regular.
+                const int cur = static_cast<int>(REXCVAR_GET(skate3_stance));
+                if (cur != chosen) {
+                  rex::cvar::SetFlagByName("skate3_stance",
+                                           std::to_string(chosen));
+                  REXLOG_INFO(
+                      "[auto-stance] LOCKED stance = {} ({}); vote={}",
+                      chosen, chosen == 1 ? "regular" : "goofy",
+                      s_stance_vote);
+                } else {
+                  REXLOG_INFO(
+                      "[auto-stance] confirmed stance = {} ({}); vote={}",
+                      chosen, chosen == 1 ? "regular" : "goofy",
+                      s_stance_vote);
+                }
+                s_stance_locked = true;
+              }
+            }
+          }
+        }
+
+        // Game-mode start trigger (from the Online menu's "Start Spot Battle"
+        // action or the ` console `skate3_mode_start <secs>`). Consume the cvar
+        // back to 0 so the same button/value can start another round later.
+        const double mode_start = REXCVAR_GET(skate3_mode_start);
+        if (mode_start > 0.0) {
+          const double mode_rounds = REXCVAR_GET(skate3_mode_rounds);
+          net.StartSpotBattle(static_cast<uint32_t>(mode_start),
+                              mode_rounds < 1.0 ? 1u
+                                                : static_cast<uint32_t>(mode_rounds));
+          rex::cvar::SetFlagByName("skate3_mode_start", "0");
+        }
+        // S.K.A.T.E. start trigger (` console `skate3_skate_start <rounds>` or
+        // the Online menu). Consumed so the same value can start another game.
+        const double skate_start = REXCVAR_GET(skate3_skate_start);
+        if (skate_start > 0.0) {
+          net.StartSkate(static_cast<uint32_t>(skate_start));
+          rex::cvar::SetFlagByName("skate3_skate_start", "0");
+        }
+        // Party (v4): menu writes these one-shot cvars, game consumes + clears.
+        {
+          std::string target = rex::cvar::Query<std::string>("skate3_party_invite");
+          if (!target.empty()) {
+            net.InvitePlayer(target);
+            rex::cvar::SetFlagByName("skate3_party_invite", "");
+          }
+          std::string accept_from = rex::cvar::Query<std::string>("skate3_party_accept");
+          if (!accept_from.empty()) {
+            net.AcceptInvite(accept_from);
+            rex::cvar::SetFlagByName("skate3_party_accept", "");
+          }
+          if (REXCVAR_GET(skate3_party_leave)) {
+            net.LeaveParty();
+            rex::cvar::SetFlagByName("skate3_party_leave", "false");
+          }
+          // Mirror the cvar into the net system whenever it disagrees with the
+          // live party privacy. This lets the menu toggle drive the state.
+          {
+            const bool cvar_priv = REXCVAR_GET(skate3_party_private);
+            const bool live_priv = net.InPrivateParty();
+            if (cvar_priv != live_priv) {
+              net.SetPartyPrivate(cvar_priv);
+            }
+          }
+        }
+
+        // A1 FULL-BODY capture: publish EVERY skinned body-part mesh's palette,
+        // ROOT-RELATIVE (PR[i] = inv(root)*palette[i] -> small, character-space
+        // transforms that survive the float16 wire pack), ordered by ib_count
+        // DESC = "rank". The receiver rebuilds each mesh from its own rank, so
+        // the WHOLE remote body animates with its own motion. Per-mesh (not one
+        // reference) because the ~11 skater meshes don't share a consistent
+        // skeleton -- each carries its own palette. Gated by
+        // skate3_net_replicate_bones.
+        if (REXCVAR_GET(skate3_net_replicate_bones) && skater_entity != 0) {
+          std::vector<const DrawItem*> meshes;
+          for (const DrawItem& item : scene.items) {
+            skate3::native_entity::CtxInfo info;
+            if (item.ctx != 0 &&
+                skate3::native_entity::LookupCtx(item.ctx, &info) &&
+                info.entity == skater_entity && item.skinned &&
+                item.bones.size() >= 12) {
+              meshes.push_back(&item);
+            }
+          }
+          // Stable, LOD-robust order shared with the render side: ib_count DESC
+          // (mesh addr breaks ties deterministically within a run).
+          std::sort(meshes.begin(), meshes.end(),
+                    [](const DrawItem* a, const DrawItem* b) {
+                      if (a->ib_count != b->ib_count) return a->ib_count > b->ib_count;
+                      return a->mesh > b->mesh;
+                    });
+          size_t nmesh = meshes.size();
+          if (nmesh > skate3::net::kMaxSkaterMeshes)
+            nmesh = skate3::net::kMaxSkaterMeshes;
+          skate3::net::MultiMeshPose mm;
+          mm.mesh_count = static_cast<uint8_t>(nmesh);
+          float root_inv[12];
+          InvertAffine12(skater_rows, root_inv);
+          for (size_t m = 0; m < nmesh; ++m) {
+            const DrawItem* it = meshes[m];
+            size_t nb = it->bones.size() / 12;
+            if (nb > skate3::net::kMaxPoseBones) nb = skate3::net::kMaxPoseBones;
+            skate3::net::SkeletonPose& pose = mm.meshes[m];
+            pose.bone_count = static_cast<uint8_t>(nb);
+            mm.keys[m] = it->ib_count;
+            for (size_t i = 0; i < nb; ++i) {
+              float pr[12];
+              ComposeAffine12(root_inv, &it->bones[i * 12], pr);
+              pose.rot[i] = AffineRowsToQuat(pr);
+              pose.pos[i] = {pr[3], pr[7], pr[11]};
+            }
+          }
+          net.SetLocalSkaterMeshPoses(mm);
+          static uint32_t s_cap_log = 0;
+          if (nmesh > 0 && (++s_cap_log % 120) == 0) {
+            REXLOG_INFO("[a1-diag] capture meshes={} top_ib={} bones={}", nmesh,
+                        meshes[0]->ib_count, meshes[0]->bones.size() / 12);
+          }
+        }
+      }
+      // Remote skaters, interpolated to the net clock. Surfaced through a
+      // rate-limited position log so a two-peer session is verifiable from
+      // the logs, and (below) rendered by cloning the local player's
+      // already-posed scene items for this frame and retargeting them onto
+      // each remote's sampled root transform -- the wire protocol only
+      // carries a root position+quaternion, not a full remote skeleton, so
+      // this is the only way to get a plausibly-posed remote skater without
+      // fabricating a real guest entity.
+      std::vector<skate3::net::RemoteSkaterView> remotes =
+          net.SampleRemoteSkaters(net.NowMs());
+      // Private-party filter: when the local player is in a private party,
+      // non-party peers are hidden (no clone, no puppet, no HUD trick label).
+      // Everyone still shares the transport; this is a presentation filter.
+      if (net.InPrivateParty()) {
+        remotes.erase(
+            std::remove_if(remotes.begin(), remotes.end(),
+                           [&](const skate3::net::RemoteSkaterView& r) {
+                             return !net.InSameParty(r.id);
+                           }),
+            remotes.end());
+      }
+      static uint32_t s_remote_log_frame = 0;
+      if (!remotes.empty() && (++s_remote_log_frame % 120) == 0) {
+        for (const skate3::net::RemoteSkaterView& r : remotes) {
+          if (!r.valid) continue;
+          REXLOG_INFO(
+              "[net] remote skater id={} pos=({:.2f},{:.2f},{:.2f}) rtt={}ms",
+              r.id, r.state.position.x, r.state.position.y, r.state.position.z,
+              r.rtt_ms);
+        }
+      }
+
+      // [net-real] REAL remote skaters: represent each remote peer with one of
+      // the game's own ambient AI skater entities (own model + board + the
+      // game's animation), positioned at the remote's synced net position.
+      // Proven by the puppet PoC that relocating a real skater's skinned items
+      // works; here we (1) never touch the player anchor (skater_entity),
+      // (2) pin one dedicated ambient skater per peer (sticky, unique per
+      // frame), (3) drive it to the remote's net position. Translation-only v1:
+      // the puppet keeps its own ambient animation/facing, just repositioned.
+      if (have_local && REXCVAR_GET(skate3_net_real_skaters) &&
+          !remotes.empty()) {
+        // This frame's non-player skater-family entities -> their skinned item
+        // indices, plus each one's current world position (bone0) for proximity
+        // picking.
+        struct SkaterEnt { std::vector<size_t> items; float pos[3] = {0, 0, 0}; };
+        std::unordered_map<uint32_t, SkaterEnt> avail;
+        for (size_t i = 0; i < scene.items.size(); ++i) {
+          const DrawItem& item = scene.items[i];
+          if (!item.skinned || item.ctx == 0 || item.bones.size() < 12) continue;
+          skate3::native_entity::CtxInfo info;
+          if (!skate3::native_entity::LookupCtx(item.ctx, &info)) continue;
+          if (info.entity == skater_entity || info.entity == 0) continue;
+          if (info.cls != skate3::native_entity::EntClass::kSkater &&
+              info.cls != skate3::native_entity::EntClass::kColorized &&
+              info.cls != skate3::native_entity::EntClass::kCac &&
+              info.cls != skate3::native_entity::EntClass::kSkaterAux) {
+            continue;
+          }
+          SkaterEnt& se = avail[info.entity];
+          if (se.items.empty()) {
+            se.pos[0] = item.bones[3];
+            se.pos[1] = item.bones[7];
+            se.pos[2] = item.bones[11];
+          }
+          se.items.push_back(i);
+        }
+
+        // Persistent per-peer avatar. Each peer holds ONE claimed skater;
+        // we cache its posed items every frame it is drawn, so when the game
+        // culls/despawns it (its own AI wandered off, or it streamed out) we
+        // keep rendering the cached pose at the remote's position instead of
+        // the avatar vanishing or swapping to another random model. Grounding:
+        // anchor by the skater's ROOT (+416), not a mid-body bone, so it sits
+        // on the ground. New skaters are claimed by PROXIMITY to the remote
+        // (nearest one stays loaded and needs the least relocation).
+        struct PuppetSlot {
+          uint32_t entity = 0;
+          int absent = 0;
+          int max_items = 0;              // fullest mesh count seen (cache gate)
+          std::vector<DrawItem> cache;    // last FULL live skinned items (by value)
+          float cache_root[3] = {0, 0, 0};  // skater +416 root when cached
+        };
+        static std::unordered_map<uint32_t, PuppetSlot> s_remote_puppet;
+        constexpr int kHoldFrames = 600;  // hold a cached avatar this long before reclaiming
+        std::vector<uint32_t> used;
+        auto taken = [&](uint32_t e) {
+          for (uint32_t u : used) if (u == e) return true;
+          return false;
+        };
+        // Claim skaters near the LOCAL player (camera): those stay drawn/live
+        // (the game culls by the skater's real position, which we don't change),
+        // so the avatar animates instead of freezing on its cached pose.
+        const float lp[3] = {skater_rows[3], skater_rows[7], skater_rows[11]};
+
+        for (const skate3::net::RemoteSkaterView& r : remotes) {
+          if (!r.valid) continue;
+          const uint32_t pid = static_cast<uint32_t>(r.id);
+          PuppetSlot& slot = s_remote_puppet[pid];
+          const float tgt[3] = {r.state.position.x, r.state.position.y,
+                                r.state.position.z};
+
+          // Resolve the claimed skater: keep the held one if it is still drawn,
+          // else reclaim (only past the hold window) the NEAREST free skater.
+          uint32_t pup = 0;
+          if (slot.entity != 0 && avail.count(slot.entity) && !taken(slot.entity)) {
+            pup = slot.entity;
+          } else if (slot.entity == 0 || slot.absent >= kHoldFrames ||
+                     taken(slot.entity)) {
+            uint32_t best = 0;
+            float best_d = 1e30f;
+            for (const auto& [ent, se] : avail) {
+              if (taken(ent)) continue;
+              const float ex = se.pos[0] - lp[0], ey = se.pos[1] - lp[1],
+                          ez = se.pos[2] - lp[2];
+              const float d = ex * ex + ey * ey + ez * ez;
+              if (d < best_d) { best_d = d; best = ent; }
+            }
+            if (best != 0) {
+              pup = best;
+              slot.entity = best;
+              slot.absent = 0;
+              slot.cache.clear();
+              slot.max_items = 0;
+            }
+          }
+
+          if (pup != 0 && avail.count(pup)) {
+            // LIVE: claimed skater is drawn. Cache it, then relocate its live
+            // items to the remote, grounded by the skater root.
+            used.push_back(pup);
+            const SkaterEnt& se = avail[pup];
+            float purow[12], root[3];
+            if (skate3::native_entity::ReadEntityWorldRowsByEntity(base, pup, purow)) {
+              root[0] = purow[3]; root[1] = purow[7]; root[2] = purow[11];
+            } else {
+              root[0] = se.pos[0]; root[1] = se.pos[1]; root[2] = se.pos[2];
+            }
+            // Cache only a COMPLETE mesh set (>= the fullest seen), so a partial
+            // LOD frame can't freeze a half-body (the "floating shirt" glitch).
+            if (static_cast<int>(se.items.size()) >= slot.max_items) {
+              slot.max_items = static_cast<int>(se.items.size());
+              slot.cache.clear();
+              slot.cache.reserve(se.items.size());
+              for (size_t idx : se.items) slot.cache.push_back(scene.items[idx]);
+              slot.cache_root[0] = root[0];
+              slot.cache_root[1] = root[1];
+              slot.cache_root[2] = root[2];
+            }
+            slot.absent = 0;
+            const float dx = tgt[0] - root[0], dy = tgt[1] - root[1],
+                        dz = tgt[2] - root[2];
+            for (size_t idx : se.items) {
+              DrawItem& it = scene.items[idx];
+              for (size_t b = 0; b + 12 <= it.bones.size(); b += 12) {
+                it.bones[b + 3] += dx;
+                it.bones[b + 7] += dy;
+                it.bones[b + 11] += dz;
+              }
+            }
+            if ((s_remote_log_frame % 120) == 0) {
+              REXLOG_INFO("[net-real] peer={} puppet={:08X} LIVE items={} "
+                          "pos=({:.1f},{:.1f},{:.1f})",
+                          pid, pup, se.items.size(), tgt[0], tgt[1], tgt[2]);
+            }
+          } else if (!slot.cache.empty()) {
+            // ABSENT: keep the avatar visible from its cached pose so it never
+            // vanishes or changes model. Frozen until the skater is drawn again.
+            slot.absent++;
+            const float dx = tgt[0] - slot.cache_root[0],
+                        dy = tgt[1] - slot.cache_root[1],
+                        dz = tgt[2] - slot.cache_root[2];
+            for (const DrawItem& src : slot.cache) {
+              DrawItem inj = src;
+              inj.ctx = 0;
+              inj.retained = false;
+              inj.pending = false;
+              for (size_t b = 0; b + 12 <= inj.bones.size(); b += 12) {
+                inj.bones[b + 3] += dx;
+                inj.bones[b + 7] += dy;
+                inj.bones[b + 11] += dz;
+              }
+              scene.items.push_back(std::move(inj));
+            }
+            if ((s_remote_log_frame % 120) == 0) {
+              REXLOG_INFO("[net-real] peer={} puppet={:08X} CACHED items={} "
+                          "absent={} pos=({:.1f},{:.1f},{:.1f})",
+                          pid, slot.entity, slot.cache.size(), slot.absent,
+                          tgt[0], tgt[1], tgt[2]);
+            }
+          }
+        }
+      }
+
+      if (have_local && REXCVAR_GET(skate3_net_render_remote_skaters) &&
+          !REXCVAR_GET(skate3_net_real_skaters) && !remotes.empty()) {
+        // Collected BY VALUE: the push_back calls below can reallocate
+        // scene.items and would invalidate any references/pointers taken
+        // during this scan.
+        std::vector<DrawItem> local_player_items;
+        for (const DrawItem& item : scene.items) {
+          skate3::native_entity::CtxInfo info;
+          if (item.ctx != 0 &&
+              skate3::native_entity::LookupCtx(item.ctx, &info) &&
+              info.entity == skater_entity) {
+            local_player_items.push_back(item);
+          }
+        }
+        if ((s_remote_log_frame % 120) == 0) {
+          REXLOG_INFO(
+              "[net] render bridge: have_local={} skater_entity={:#x} "
+              "local_items={} remotes={}",
+              have_local, skater_entity, local_player_items.size(),
+              remotes.size());
+        }
+        if (!local_player_items.empty()) {
+          float local_inv[12];
+          InvertAffine12(skater_rows, local_inv);
+
+          for (const skate3::net::RemoteSkaterView& r : remotes) {
+            if (!r.valid) continue;
+            float remote_rows[12];
+            QuatPosToAffine12(r.state.rotation, r.state.position, remote_rows);
+            float delta[12];
+            ComposeAffine12(remote_rows, local_inv, delta);  // root mirror fallback
+
+            const bool pose_ok = REXCVAR_GET(skate3_net_replicate_bones) &&
+                                 r.has_pose && r.pose.mesh_count > 0;
+            if (pose_ok && (s_remote_log_frame % 120) == 0) {
+              REXLOG_INFO("[a1-diag] render pose_meshes={} key0={} bones0={}",
+                          r.pose.mesh_count, r.pose.keys[0],
+                          r.pose.meshes[0].bone_count);
+            }
+
+            // Pair a clone mesh with the remote's palette by CONTENT ID
+            // (ib_count + bone_count) -- an exact identity for the SAME asset on
+            // both machines (the shared base body always matches; matching
+            // clothing matches too).
+            auto find_pose =
+                [&](const DrawItem& c) -> const skate3::net::SkeletonPose* {
+              if (!pose_ok || !c.skinned) return nullptr;
+              const size_t cb = c.bones.size() / 12;
+              for (uint8_t k = 0; k < r.pose.mesh_count; ++k) {
+                if (r.pose.keys[k] == c.ib_count &&
+                    r.pose.meshes[k].bone_count > 0 &&
+                    static_cast<size_t>(r.pose.meshes[k].bone_count) == cb) {
+                  return &r.pose.meshes[k];
+                }
+              }
+              return nullptr;
+            };
+
+            // "Your model, their animation" (James's approach), robust to
+            // DIFFERENT outfits: from the matched mesh with the MOST bones (the
+            // shared base body), build a per-bone WORLD delta D = remote_skel *
+            // inv(local_skel). The base body's inverse-bind cancels (same asset
+            // on both), so D is the pure skeleton motion; applying D to ANY other
+            // mesh -> D * (local_skel*mesh_bind) = remote_skel*mesh_bind, i.e.
+            // that mesh driven by the REMOTE's real animation using its OWN bind.
+            // So unmatched clothing animates correctly instead of mirroring.
+            std::vector<float> Dbones;
+            size_t ref_bones = 0;
+            {
+              const DrawItem* bestit = nullptr;
+              const skate3::net::SkeletonPose* bestmp = nullptr;
+              size_t bestnb = 0;
+              for (const DrawItem& it : local_player_items) {
+                const skate3::net::SkeletonPose* mp = find_pose(it);
+                if (mp) {
+                  const size_t nb = it.bones.size() / 12;
+                  if (nb > bestnb) { bestnb = nb; bestit = &it; bestmp = mp; }
+                }
+              }
+              if (bestit) {
+                ref_bones = bestnb;
+                Dbones.resize(ref_bones * 12);
+                for (size_t b = 0; b < ref_bones; ++b) {
+                  float pr[12], rw[12], linv[12];
+                  QuatPosToAffine12(bestmp->rot[b], bestmp->pos[b], pr);
+                  ComposeAffine12(remote_rows, pr, rw);          // remote world bone
+                  InvertAffine12(&bestit->bones[b * 12], linv);  // inv(local world bone)
+                  ComposeAffine12(rw, linv, &Dbones[b * 12]);    // D = remote * inv(local)
+                }
+              }
+            }
+
+            for (size_t j = 0; j < local_player_items.size(); ++j) {
+              DrawItem clone = local_player_items[j];
+              // ctx=0: no real guest MeshContext backs this synthetic item;
+              // reusing the source ctx would let the occlusion-cull pass suppress
+              // the LOCAL player's own mesh if this clone gets culled.
+              clone.ctx = 0;
+              clone.retained = false;
+              clone.pending = false;
+
+              const skate3::net::SkeletonPose* mp = find_pose(clone);
+              if (clone.skinned) {
+                size_t bone = 0;
+                size_t clamped_bones = 0;   // diagnostic counter this mesh.
+                for (size_t b = 0; b + 12 <= clone.bones.size();
+                     b += 12, ++bone) {
+                  float tmp[12];
+                  if (mp) {
+                    float pr[12];
+                    QuatPosToAffine12(mp->rot[bone], mp->pos[bone], pr);
+                    ComposeAffine12(remote_rows, pr, tmp);           // exact match
+                  } else if (bone < ref_bones) {
+                    // Skeleton-delta path. Safety: if D's rotation is >~170°
+                    // (trace of the 3x3 rotation < -0.94), it's a quaternion
+                    // sign flip -- applying it as-is spins the bone the "long
+                    // way" and looks like a broken limb during shuvits/spins.
+                    // Fall back to the root-mirror delta for that bone instead
+                    // (visually mild vs the alternative of a flipped mesh).
+                    const float* D = &Dbones[bone * 12];
+                    const float trace3 = D[0] + D[5] + D[10];
+                    if (trace3 < -0.94f) {
+                      ComposeAffine12(delta, &clone.bones[b], tmp);
+                      ++clamped_bones;
+                    } else {
+                      ComposeAffine12(D, &clone.bones[b], tmp);
+                    }
+                  } else {
+                    ComposeAffine12(delta, &clone.bones[b], tmp);    // root mirror
+                  }
+                  std::memcpy(&clone.bones[b], tmp, sizeof(tmp));
+                }
+                if (clamped_bones > 0) {
+                  static uint32_t s_glitch_log = 0;
+                  if ((++s_glitch_log % 30) == 0) {
+                    REXLOG_INFO(
+                        "[net-glitch] peer={} mesh_bones={} clamped={} "
+                        "local_trick='{}' peer_trick='{}'",
+                        r.id, bone, clamped_bones,
+                        net.LocalTrick(), r.current_trick);
+                  }
+                }
+              } else {
+                float orig_rows[12], new_rows[12];
+                World16ToAffine12(clone.world, orig_rows);
+                ComposeAffine12(delta, orig_rows, new_rows);
+                Affine12ToWorld16(new_rows, clone.world);
+              }
+              scene.items.push_back(std::move(clone));
+            }
+          }
+        }
+      }
+    }
   }
 
   // Camera re-timing (see SmoothCamera): replace the guest's sim-stepped

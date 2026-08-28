@@ -155,4 +155,25 @@ void NoteAcceptedWorldCompare(const float bank_rows[12],
 // Rate-limited ident[] stats line; call once per built frame.
 void EmitStats();
 
+// [online play] World-matrix rows (m_MatLtoWTrans layout: 3 affine rows,
+// translation in components 3/7/11) for a caller-chosen entity address, with
+// the same structural sanity checks as ReadPrimarySkaterWorld. Read-only. The
+// online render bridge resolves the local player by finding the skater-family
+// entity that owns the most DrawItems in the current frame's scene (the entity
+// actually being drawn, which the global bind_count heuristic misses), then
+// reads that entity's transform through here. Returns false on an unreadable /
+// structurally-implausible matrix (e.g. teardown, recycled memory).
+bool ReadEntityWorldRowsByEntity(uint8_t* base, uint32_t entity,
+                                 float out_rows[12]);
+
+// [online play] Best-effort local-player skater transform for network
+// replication: returns the world matrix rows (m_MatLtoWTrans layout, i.e. the
+// 3 affine rows with translation in components 3/7/11) of the most-active
+// view-live skater-family entity (kSkater/kColorized/kCac/kSkaterAux). In
+// single-player free-roam that is the player's skater; this is a heuristic that
+// wants live validation with two peers, not a proven local-player identity.
+// Returns false when no skater entity is currently live. `out_entity` (optional)
+// receives the chosen guest entity address.
+bool ReadPrimarySkaterWorld(uint8_t* base, float out_rows[12], uint32_t* out_entity);
+
 }  // namespace skate3::native_entity

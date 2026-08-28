@@ -13,6 +13,7 @@
 #include <rex/ui/presenter.h>
 
 #include "skate3_native_scene.h"
+#include "net/skate3_net_system.h"
 
 REXCVAR_DEFINE_BOOL(skate3_native_render_mode_indicator, false, "Skate 3",
                     "Small top-right corner readout of which renderer produced the "
@@ -20,6 +21,11 @@ REXCVAR_DEFINE_BOOL(skate3_native_render_mode_indicator, false, "Skate 3",
                     "EMULATED (Xenos GPU emulation; menus/loading yields, F5 off). "
                     "Shows automatically while the native scene renderer is "
                     "switched off, regardless of this setting.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(skate3_net_hud, false, "Skate 3",
+                    "Debug online overlay: the top-left player list with scores, "
+                    "ping and current trick. Off by default (Accessibility "
+                    "settings toggle it); the game-mode scoreboard is separate.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 // Hook-layer master (boot-time), shown read-only.
@@ -33,6 +39,7 @@ REXCVAR_DECLARE(bool, skate3_native_render_scene_transparents);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_shadows);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_backface_cull);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_2d);
+REXCVAR_DECLARE(int32_t, skate3_stance);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_splines);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_quadlists);
 REXCVAR_DECLARE(bool, skate3_native_render_scene_world_items);
@@ -1220,6 +1227,14 @@ void NativeDebugDialog::OnDraw(ImGuiIO& io) {
 }
 
 void RenderModeIndicator::OnDraw(ImGuiIO& io) {
+  // Online net HUD + game-mode scoreboard render WHENEVER online play is active,
+  // independent of the render-mode-indicator debug cvar (they self-gate on
+  // system.active()). Kept above the indicator's cvar early-return so every
+  // instance shows the net UI without needing skate3_native_render_mode_indicator
+  // set in its config (that gate previously hid the scoreboard on peers whose
+  // config didn't enable it).
+  DrawNetOverlay(io);
+
   // Force-show while the native scene renderer is switched off (F5, the
   // settings Renderer row, or the boot-time hook-layer master) or has hit an
   // unrecoverable failure and permanently yields to the emulated output:
@@ -1254,6 +1269,306 @@ void RenderModeIndicator::OnDraw(ImGuiIO& io) {
                             : ImVec4(1.0f, 0.65f, 0.25f, 1.0f),
                      "%s", native ? "NATIVE" : "EMULATED");
   ImGui::End();
+}
+
+// [S.K.A.T.E.] Bottom-left "MATCH THIS" plate for the SET trick during Match.
+// James's call: drop the flick-path circle/arrow, show the trick NAME only.
+// Reads-clean at a glance, no stance mirror to get wrong, and works for every
+// trick (grabs/grinds are excluded upstream so a matcher only ever sees flip
+// families here anyway).
+void RenderModeIndicator::DrawSetTrickHowTo(ImGuiIO& io, const std::string& trick) {
+  // Name-only plate at bottom-left: black fill, thick white border, small
+  // "MATCH THIS" caption over the trick name in a larger font. Big enough to
+  // read at a glance without occluding gameplay.
+  const float scale = std::clamp(io.DisplaySize.y / 1080.0f, 0.7f, 1.6f);
+  const ImVec2 pad(20.0f * scale, 12.0f * scale);
+  const float caption_size = 18.0f * scale;
+  const float name_size = 34.0f * scale;
+  const char* caption = "MATCH THIS";
+
+  // Auto-size the panel to fit the trick name, with a minimum width so short
+  // names still look like a plate rather than a chip.
+  const float name_w = ImGui::GetFont()->CalcTextSizeA(name_size, FLT_MAX,
+                                                        0.0f, trick.c_str()).x;
+  const float caption_w = ImGui::GetFont()->CalcTextSizeA(caption_size, FLT_MAX,
+                                                          0.0f, caption).x;
+  const float content_w = std::max(name_w, caption_w);
+  const float panel_w = std::max(240.0f * scale, content_w + pad.x * 2.0f);
+  const float panel_h = pad.y * 2.0f + caption_size + 6.0f * scale + name_size;
+
+  ImGui::SetNextWindowPos(ImVec2(24.0f * scale, io.DisplaySize.y - 24.0f * scale),
+                          ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+  ImGui::SetNextWindowSize(ImVec2(panel_w, panel_h), ImGuiCond_Always);
+  ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.78f));
+  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 1.0f, 0.95f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 3.0f);
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, pad);
+  ImGui::Begin("##skate3_trick_howto", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                   ImGuiWindowFlags_NoSavedSettings |
+                   ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 wp = ImGui::GetWindowPos();
+  ImFont* font = ImGui::GetFont();
+  const ImU32 kCaption = IM_COL32(200, 220, 255, 210);
+  const ImU32 kName = IM_COL32(255, 240, 100, 250);   // gold, matches YOUR TURN.
+
+  const float caption_x = wp.x + panel_w * 0.5f - caption_w * 0.5f;
+  const float caption_y = wp.y + pad.y;
+  dl->AddText(font, caption_size, ImVec2(caption_x, caption_y), kCaption, caption);
+  const float name_x = wp.x + panel_w * 0.5f - name_w * 0.5f;
+  const float name_y = caption_y + caption_size + 6.0f * scale;
+  dl->AddText(font, name_size, ImVec2(name_x, name_y), kName, trick.c_str());
+
+  ImGui::End();
+  ImGui::PopStyleVar(2);
+  ImGui::PopStyleColor(2);
+}
+
+// [online play] Toggleable on-screen net diagnostics: session state, local id,
+// and each connected remote peer with its interpolated position and RTT. Only
+// visible while online play is active, so single-player is unaffected. This is
+// how a two-peer session is verified without reading log files, and stands in
+// for the not-yet-rendered remote skater mesh.
+void RenderModeIndicator::DrawNetOverlay(ImGuiIO& io) {
+  namespace net = skate3::net;
+  auto& system = net::Skate3Net();
+  if (!system.active()) {
+    return;
+  }
+  const net::NetStatus st = system.Status();
+
+  const char* mode = st.mode == net::SessionMode::kHost      ? "HOST"
+                     : st.mode == net::SessionMode::kClient  ? "CLIENT"
+                                                             : "OFF";
+  const char* state = st.state == net::SessionState::kConnected    ? "connected"
+                      : st.state == net::SessionState::kConnecting  ? "connecting"
+                      : st.state == net::SessionState::kFailed      ? "failed"
+                      : st.state == net::SessionState::kDisconnected ? "disconnected"
+                                                                     : "idle";
+
+  // Debug net HUD (player list / scores / ping / trick): OFF by default,
+  // toggled from Accessibility settings. The game-mode scoreboard below is
+  // separate and shows only while a mode is active.
+  if (REXCVAR_GET(skate3_net_hud)) {
+  ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+  ImGui::SetNextWindowBgAlpha(0.4f);
+  ImGui::Begin("##skate3_net_overlay", nullptr,
+               ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                   ImGuiWindowFlags_AlwaysAutoResize |
+                   ImGuiWindowFlags_NoSavedSettings |
+                   ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+  ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
+                     "NET %s  %s  id=%u  peers=%u", mode, state,
+                     static_cast<unsigned>(st.local_id), st.peer_count);
+  if (!st.last_error.empty()) {
+    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "err: %s", st.last_error.c_str());
+  }
+  // Local player's live score + current trick (game-mode foundation).
+  {
+    const std::string lt = system.LocalTrick();
+    ImGui::TextColored(ImVec4(1.0f, 0.9f, 0.3f, 1.0f), "  YOU  score=%u  trick=%s",
+                       static_cast<unsigned>(system.LocalScore()),
+                       lt.empty() ? "-" : lt.c_str());
+  }
+  const std::vector<net::RemoteSkaterView> remotes =
+      system.SampleRemoteSkaters(system.NowMs());
+  if (remotes.empty()) {
+    ImGui::TextDisabled("  (no remote players)");
+  }
+  for (const net::RemoteSkaterView& r : remotes) {
+    if (r.valid) {
+      ImGui::Text("  #%u %s  score=%u  trick=%s  %ums",
+                  static_cast<unsigned>(r.id),
+                  r.name.empty() ? "?" : r.name.c_str(),
+                  static_cast<unsigned>(r.state.score),
+                  r.current_trick.empty() ? "-" : r.current_trick.c_str(),
+                  r.rtt_ms);
+    } else {
+      ImGui::Text("  #%u %s  (waiting for data)",
+                  static_cast<unsigned>(r.id), r.name.empty() ? "?" : r.name.c_str());
+    }
+  }
+  ImGui::End();
+  }  // if (skate3_net_hud)
+
+  // --- Online game-mode scoreboard (Milestone D) -----------------------------
+  // Styled to echo base Skate 3's session board: dark warm panel, tan/orange
+  // header + "SESSION BEST" rows. Only shows while a round is running.
+  const net::GameModeView gv = system.GetGameModeView();
+  if (gv.active) {
+    const ImVec4 kTan(0.86f, 0.72f, 0.47f, 1.0f);
+    const ImVec4 kOrange(0.96f, 0.60f, 0.16f, 1.0f);
+    const ImVec4 kWhite(0.93f, 0.92f, 0.89f, 1.0f);
+    const ImVec4 kGold(1.0f, 0.84f, 0.22f, 1.0f);
+    const ImVec4 kDim(0.62f, 0.60f, 0.56f, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.09f, 0.08f, 0.065f, 0.86f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.55f, 0.42f, 0.20f, 0.85f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14.0f, 10.0f));
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12.0f, 12.0f),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(290.0f, 0.0f), ImGuiCond_Always);
+    ImGui::Begin("##skate3_mode_board", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+    const uint32_t secs = (gv.remaining_ms + 999u) / 1000u;
+    if (gv.phase == net::GamePhase::kCountdown) {
+      ImGui::TextColored(kOrange, "SPOT BATTLE");
+      ImGui::SetWindowFontScale(2.4f);
+      ImGui::TextColored(kWhite, "  %u", secs == 0u ? 1u : secs);
+      ImGui::SetWindowFontScale(1.0f);
+      ImGui::TextColored(kDim, "get ready...");
+    } else if (gv.phase == net::GamePhase::kActive) {
+      ImGui::TextColored(kOrange, "SPOT BATTLE");
+      ImGui::SameLine();
+      ImGui::TextColored(kTan, "  %u:%02u", secs / 60u, secs % 60u);
+    } else {
+      ImGui::TextColored(kGold, "RESULTS");
+    }
+    ImGui::Separator();
+    ImGui::TextColored(kTan, "SESSION BEST");
+    int rank = 1;
+    for (const net::GameModeEntry& e : gv.entries) {
+      const bool win = gv.phase == net::GamePhase::kResults &&
+                       e.id == gv.winner && e.best > 0;
+      const ImVec4 col = win ? kGold : kWhite;
+      ImGui::TextColored(col, "%d. %s", rank++, e.name.c_str());
+      ImGui::SameLine(ImGui::GetWindowWidth() - 96.0f);
+      ImGui::TextColored(win ? kGold : kTan, "%9u", static_cast<unsigned>(e.best));
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor(2);
+
+    // Centered WINNER popup during results (auto-closes when the ~5s results
+    // phase ends and the round returns to idle).
+    if (gv.phase == net::GamePhase::kResults) {
+      const char* wname = nullptr;
+      uint32_t wbest = 0;
+      for (const net::GameModeEntry& e : gv.entries) {
+        if (e.id == gv.winner) { wname = e.name.c_str(); wbest = e.best; break; }
+      }
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.08f, 0.06f, 0.93f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.90f, 0.70f, 0.22f, 0.95f));
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.5f);
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(30.0f, 22.0f));
+      ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.42f),
+                              ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+      ImGui::Begin("##skate3_winner_popup", nullptr,
+                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                       ImGuiWindowFlags_AlwaysAutoResize |
+                       ImGuiWindowFlags_NoSavedSettings |
+                       ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+      ImGui::SetWindowFontScale(1.5f);
+      ImGui::TextColored(kOrange, "SPOT BATTLE");
+      ImGui::SetWindowFontScale(2.6f);
+      if (wname != nullptr && wbest > 0) {
+        ImGui::TextColored(kGold, "%s WINS!", wname);
+      } else {
+        ImGui::TextColored(kGold, "NO SCORE");
+      }
+      ImGui::SetWindowFontScale(1.25f);
+      if (wname != nullptr && wbest > 0) {
+        ImGui::TextColored(kWhite, "best line  %u", static_cast<unsigned>(wbest));
+      }
+      ImGui::SetWindowFontScale(1.0f);
+      ImGui::End();
+      ImGui::PopStyleVar(2);
+      ImGui::PopStyleColor(2);
+    }
+  }
+
+  // --- S.K.A.T.E. board ------------------------------------------------------
+  const net::SkateView sv = system.GetSkateView();
+  if (sv.active) {
+    const ImVec4 kOrange(1.0f, 0.55f, 0.15f, 1.0f);
+    const ImVec4 kGold(1.0f, 0.85f, 0.3f, 1.0f);
+    const ImVec4 kWhite(0.95f, 0.95f, 0.95f, 1.0f);
+    const ImVec4 kDim(0.5f, 0.5f, 0.5f, 1.0f);
+    const unsigned secs = (sv.remaining_ms + 999) / 1000;
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 12.0f, 12.0f),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.55f);
+    ImGui::Begin("##skate3_skate_board", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+    ImGui::TextColored(kOrange, "S.K.A.T.E.   round %u/%u",
+                       static_cast<unsigned>(sv.round),
+                       static_cast<unsigned>(sv.rounds));
+    switch (sv.phase) {
+      case net::SkatePhase::kCountdown:
+        ImGui::TextColored(kGold, "starting in %u...", secs); break;
+      case net::SkatePhase::kSet:
+        ImGui::TextColored(kWhite, "SET a trick   %us", secs); break;
+      case net::SkatePhase::kMatch:
+        ImGui::TextColored(kWhite, "MATCH:  %s   %us",
+                           sv.set_trick.empty() ? "?" : sv.set_trick.c_str(), secs);
+        break;
+      case net::SkatePhase::kAnnounce:
+        ImGui::TextColored(kGold, "%s",
+                           sv.message.empty() ? "..." : sv.message.c_str());
+        break;
+      case net::SkatePhase::kResults:
+        ImGui::TextColored(kGold, "GAME OVER"); break;
+      default: break;
+    }
+    ImGui::Separator();
+    for (const net::SkateLetterRow& p : sv.players) {
+      const char* L = "SKATE";
+      std::string spelled;
+      for (int i = 0; i < 5; ++i) spelled += (i < p.letters) ? L[i] : '-';
+      const ImVec4 col = (p.id == sv.current) ? kGold
+                         : (p.letters >= 5)   ? kDim
+                                              : kWhite;
+      ImGui::TextColored(col, "%-14s %s%s", p.name.c_str(), spelled.c_str(),
+                         p.id == sv.current ? "  <" : "");
+    }
+    ImGui::End();
+
+    // Center-left announce beat (paced result message): big text in a box with
+    // a thick white outline and a black fill.
+    auto centered_box = [&](const char* text, const ImVec4& color, float scale) {
+      ImGui::SetNextWindowPos(
+          ImVec2(io.DisplaySize.x * 0.04f, io.DisplaySize.y * 0.44f),
+          ImGuiCond_Always, ImVec2(0.0f, 0.5f));
+      ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.82f));
+      ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 4.0f);
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 11.0f));
+      ImGui::Begin("##skate3_turn_msg", nullptr,
+                   ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                       ImGuiWindowFlags_AlwaysAutoResize |
+                       ImGuiWindowFlags_NoSavedSettings |
+                       ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+      ImGui::SetWindowFontScale(scale);
+      ImGui::TextColored(color, "%s", text);
+      ImGui::SetWindowFontScale(1.0f);
+      ImGui::End();
+      ImGui::PopStyleVar(2);
+      ImGui::PopStyleColor(2);
+    };
+    if (sv.phase == net::SkatePhase::kAnnounce && !sv.message.empty()) {
+      centered_box(sv.message.c_str(), kGold, 1.5f);
+    } else if ((sv.your_turn || sv.youre_next) &&
+               (sv.phase == net::SkatePhase::kSet ||
+                sv.phase == net::SkatePhase::kMatch)) {
+      centered_box(sv.your_turn ? "YOUR TURN" : "YOU'RE NEXT",
+                   sv.your_turn ? kGold : kWhite, 1.5f);
+    }
+
+    // Bottom-left "how-to" panel for the SET trick during Match phase: a
+    // circle with the right-stick flick path drawn on it, plus the trick
+    // name. Mirrors L/R by this viewer's stance (skate3_stance cvar) so
+    // goofy and regular players see the diagram flipped correctly.
+    if (sv.phase == net::SkatePhase::kMatch && !sv.set_trick.empty()) {
+      DrawSetTrickHowTo(io, sv.set_trick);
+    }
+  }
 }
 
 }  // namespace skate3
