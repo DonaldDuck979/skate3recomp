@@ -136,6 +136,20 @@ Ports it uses:
 Full setup instructions are in the
 [x360BlazeServer](https://github.com/DonaldDuck979/x360BlazeServer) repository.
 
+### Title Update 3
+
+Skate 3 needs Title Update 3, which the Setup screen downloads automatically the
+first time you install. The download URL is the `skate3_title_update_url` cvar.
+Its built-in default is a community title-update host; if that host is ever down
+you'll see "The download server returned HTTP 502" at Setup — in that case either
+use Setup's **Select file…** option with a TU3 package you already have, or point
+`skate3_title_update_url` at another mirror.
+
+Server operators can host the TU package on their own server (any static file
+host works) and set `skate3_title_update_url` to it for reliability — the online
+release does exactly this so installs don't depend on a third-party host being
+up.
+
 ## Native Renderer
 
 Since v2.0.0 the game no longer relies on emulating the Xbox 360 GPU. A native renderer draws the game directly through Direct3D 12 or Vulkan, covering the entire game: gameplay, menus, HUD, loading screens, videos, and the photo, replay, skater, and park editors. It runs exact ports of the game's own material shading for the world, characters, vehicles, and water, so the image stays at close visual parity with the original console output while running far faster and more efficiently.
