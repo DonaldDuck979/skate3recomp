@@ -120,9 +120,10 @@ The host forwards their `skate3_net_port` (UDP) or plays over LAN; clients set
 
 ## Hosting Your Own Server
 
-The revival server is a separate open-source project (a 360-capable EA Nation /
-Blaze server). It's a self-contained build — copy it to any Windows machine or
-VPS and run it, then point your game's `skate3_blaze_server_ip` at it.
+The revival server is a separate open-source project:
+[**x360BlazeServer**](https://github.com/DonaldDuck979/x360BlazeServer) — a
+360-capable EA Nation / Blaze server. Copy it to any Windows machine or VPS and
+run it, then point your game's `skate3_blaze_server_ip` at it.
 
 Ports it uses:
 
@@ -132,7 +133,8 @@ Ports it uses:
 | 80 | TCP | Web (login config, Skate.Feed, achievements) |
 | 17000–17500 | UDP | Per-game relay (used once players join a game session) |
 
-Full setup instructions are in that project's repository.
+Full setup instructions are in the
+[x360BlazeServer](https://github.com/DonaldDuck979/x360BlazeServer) repository.
 
 ## Native Renderer
 
