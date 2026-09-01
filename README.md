@@ -10,6 +10,13 @@ As of v2.0.0, the game runs on a native renderer built directly on Direct3D 12 a
 
 The new native renderer is early and is likely to have issues, I haven't tested the game all the way through.
 
+This build also revives Skate 3's **online play**. The game's original EA Nation
+online is redirected to community-run revival servers instead of EA's (which are
+long shut down), so you can get back online and share sessions with other players
+— no EA or Xbox Live account required. On top of that, a set of custom
+peer-to-peer modes is included: Spot Battle, S.K.A.T.E. (using the game's own
+trick detection), and a party system. See [Online Play](#online-play) below.
+
 The project does not include Skate 3 retail game files. To run or build the project, you must provide files from your own legally obtained Xbox 360 copy of Skate 3.
 
 Native Rendering Showcase (click to go to YouTube):
@@ -55,6 +62,77 @@ Notes:
 5. Click "Select ISO" to select your legally obtained copy of Skate 3.
 6. Wait for the installer to extract the game files.
 7. Click "Start Game".
+
+## Online Play
+
+Skate 3's online was built on EA's "Blaze" / EA Nation service, which EA shut
+down years ago. This build brings it back by redirecting the game's own online
+client to a **community-run revival server** instead of EA. It is unofficial and
+not affiliated with EA; you do **not** need an EA or Xbox Live account.
+
+There are two separate online systems:
+
+### 1. EA Nation (the game's native online)
+
+This is the game's own online — freeskate sessions with other players, using the
+original in-game flow.
+
+1. Launch the game and create a local player profile (pick a gamertag).
+2. Go online from the in-game menu — the game connects to the configured revival
+   server and signs you in.
+3. Each install automatically gets its own unique online identity, so players
+   don't collide on the server.
+
+How it's configured (in `settings.toml` next to the executable, or via cvars):
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `skate3_xnet_report_online` | `true` in online builds | Master switch: report the console as online and route the EA client to the revival server. |
+| `skate3_blaze_server_ip` | `127.0.0.1` | IPv4 of the Blaze server to connect to. **Release downloads ship preconfigured to a community server;** the source default is localhost for self-hosting. |
+| `skate3_blaze_server_port` | `42100` | Blaze server port. |
+
+To run your own server, point `skate3_blaze_server_ip` at it — see
+[Hosting Your Own Server](#hosting-your-own-server).
+
+### 2. Custom peer-to-peer modes (experimental)
+
+A separate, direct host/client netcode layer (built on ENet) adds modes that
+aren't in the base game:
+
+- **Spot Battle** — timed rounds for everyone in the session.
+- **S.K.A.T.E.** — using the game's own native trick detection.
+- **Party system** — invite players and form public or private parties.
+
+This layer connects players **directly** (one player hosts, others connect to
+their IP); it does not go through the Blaze server. It's off by default and
+configured with cvars:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `skate3_net_enable` | `false` | Turn the custom netcode on. Single-player is completely unaffected while off. |
+| `skate3_net_mode` | `host` | `host` to run a session, `client` to join one. |
+| `skate3_net_host` | `127.0.0.1` | For clients: the host's IP address. |
+| `skate3_net_port` | `34643` | UDP port to host on / connect to. |
+| `skate3_net_name` | `Skater` | Your display name in the session. |
+
+The host forwards their `skate3_net_port` (UDP) or plays over LAN; clients set
+`skate3_net_host` to the host's address. This layer is new and experimental.
+
+## Hosting Your Own Server
+
+The revival server is a separate open-source project (a 360-capable EA Nation /
+Blaze server). It's a self-contained build — copy it to any Windows machine or
+VPS and run it, then point your game's `skate3_blaze_server_ip` at it.
+
+Ports it uses:
+
+| Port | Proto | Purpose |
+| --- | --- | --- |
+| 42100 | TCP | Blaze (redirector + main online session) |
+| 80 | TCP | Web (login config, Skate.Feed, achievements) |
+| 17000–17500 | UDP | Per-game relay (used once players join a game session) |
+
+Full setup instructions are in that project's repository.
 
 ## Native Renderer
 
@@ -297,3 +375,12 @@ needed by this project.
   used by this project.
 - [Xenia](https://github.com/xenia-project/xenia), whose Xbox 360 research and
   tooling have helped the broader recompilation ecosystem.
+
+Online play builds on the work of the Skate 3 / Blaze revival community:
+
+- **skate6743 / Skate3BlazeServer** and **hallofmeat / Skateboard3Server** — the
+  reference Skate 3 Blaze server implementations the revival server is based on.
+- **Aim4kill** — BlazeSDK / packet-structure research.
+- **gamingrobot** — TDF (Blaze wire format) documentation.
+- [ENet](https://github.com/lsalzman/enet) — reliable UDP transport for the
+  custom peer-to-peer modes.

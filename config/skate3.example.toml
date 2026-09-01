@@ -79,7 +79,7 @@ advanced_settings_overlay_enabled = true
 
 selected_user_profile = "player"
 user_profile_name = "Player"
-user_profile_xuid = "B13E07DFF9AB6772"
+user_profile_xuid = "0000000000000000"
 user_profile_signed_in = true
 user_live_signed_in = false
 

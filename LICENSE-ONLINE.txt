@@ -1,6 +1,6 @@
 MIT License — Skate 3 Recomp Online layer
 
-Copyright (c) 2026 James (thcking42069)   <-- replace with your name/handle
+Copyright (c) 2026 James (thcking42069)
 
 This license covers the ORIGINAL online-play contributions added on top of the
 base Skate 3 native recompilation, namely (non-exhaustive):

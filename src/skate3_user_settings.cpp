@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <random>
 #include <sstream>
 #include <string_view>
 
@@ -42,13 +43,25 @@ std::string MakeProfileId(std::string_view gamertag) {
   return id;
 }
 
-uint64_t StableXuidForId(std::string_view id) {
+[[maybe_unused]] uint64_t StableXuidForId(std::string_view id) {
   uint64_t hash = 1469598103934665603ull;
   for (char c : id) {
     hash ^= static_cast<unsigned char>(c);
     hash *= 1099511628211ull;
   }
   return 0xB13E000000000000ull | (hash & 0x00003FFFFFFFFFFFull);
+}
+
+// Every newly-created profile gets a RANDOM XUID (same 0xB13E.. format) instead
+// of a deterministic hash of the gamertag. On a shared/public Blaze server the
+// XUID is the account key with one session per XUID, so two installs that both
+// hashed the default "Player" gamertag would collide into one account and kick
+// each other offline. A random 46-bit XUID makes every install a distinct
+// account. (Existing profiles loaded from profiles.toml keep their stored xuid.)
+uint64_t RandomXuid() {
+  std::random_device rd;
+  std::mt19937_64 gen((static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd()));
+  return 0xB13E000000000000ull | (gen() & 0x00003FFFFFFFFFFFull);
 }
 
 uint64_t ParseXuidString(std::string_view value) {
@@ -146,7 +159,7 @@ LocalProfile MakeDefaultProfile(std::string gamertag) {
   LocalProfile profile;
   profile.id = MakeProfileId(gamertag);
   profile.gamertag = std::move(gamertag);
-  profile.xuid = StableXuidForId(profile.id);
+  profile.xuid = RandomXuid();
   return profile;
 }
 
