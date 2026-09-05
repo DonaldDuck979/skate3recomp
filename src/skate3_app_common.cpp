@@ -595,9 +595,12 @@ std::optional<rex::PathConfig> Skate3BaseApp::OnFinalizePaths(
     ApplyDemoPathProfileOverride();
   }
 
-  const bool has_config_file = std::filesystem::exists(defaults.config_path);
-  const bool has_game_path = std::filesystem::is_directory(defaults.game_data_root);
-  if (!has_profiles_file && has_config_file && has_game_path) {
+  // Persist a newly-created profile immediately so its (now random) xuid is
+  // stable across launches. This was previously gated on a config file existing
+  // in the user-data root, which portable installs don't have -> the profile was
+  // never saved, so every launch minted a fresh random xuid and a brand-new save
+  // folder, orphaning the old one.
+  if (!has_profiles_file) {
     skate3::SaveProfiles(profiles_path_, profiles);
   }
   auto runtime_paths = defaults;
