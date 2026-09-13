@@ -94,6 +94,30 @@ How it's configured (in `settings.toml` next to the executable, or via cvars):
 To run your own server, point `skate3_blaze_server_ip` at it — see
 [Hosting Your Own Server](#hosting-your-own-server).
 
+#### Open.Roam (full-map online freeskate)
+
+Online freeskate normally keeps you inside a small play area: cross the line and
+you get a "You are leaving the online area!" warning, then get teleported back,
+and collision stops a little past the edge. **Open.Roam** removes all of that,
+using the game's own online freeskate:
+
+- No snap-back and no leaving-area warning — skate the whole district.
+- Collision streams around you everywhere, like offline freeskate.
+- Bails respawn where you fell instead of back in the play area.
+- Session markers work anywhere: **LB + D-pad Down** sets a marker (even out of
+  the old area), **LB + D-pad Up** returns to it.
+- The camera snaps back to your skater after teleports.
+- The menus call online freeskate "Open.Roam" (offline "Solo Freeskate" keeps
+  its name).
+
+Each district is reached from its own spots in the online map list (districts
+aren't physically connected in Skate 3, offline or online).
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `skate3_oob_kill_mode` | `0` (release: `1216`) | Open.Roam feature bits: `64` no snap-back / respawn where you bail, `128` collision everywhere, `1024` markers anywhere + no warning. `1216` = all. `0` = stock game. |
+| `skate3_rename_freeskate` | `false` (release: `true`) | Show online freeskate as "Open.Roam" in the menus. |
+
 ### 2. Custom peer-to-peer modes (experimental)
 
 A separate, direct host/client netcode layer (built on ENet) adds modes that
@@ -192,6 +216,7 @@ The builds include an experimental true ultrawide mode: the native renderer draw
 
 - Standard Xbox controls using an Xbox controller are the preferred and main input method.
 - PlayStation (DualShock/DualSense), Switch and most generic controllers are supported through the SDL controller backend: set Settings > Controls > Controller Backend to SDL and restart the game. Steam Input through XInput also works. On Linux and macOS the SDL backend is always used, so these controllers work out of the box.
+- The online release zip ships with the SDL backend on and **PlayStation button prompts** in the menus (`skate3_glyph_swap = true`). The PlayStation prompt art is not in this repository (it is derived from game assets); source builds without `src/skate3_ps_glyphs.h` keep the Xbox prompts.
 - Keyboard controls can be enabled in the game settings menu.
 - Press Escape on keyboard or (RB + Start) on the controller to open the game settings menu. The chord can be changed in Settings > Controls.
 

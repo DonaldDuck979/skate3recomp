@@ -287,7 +287,10 @@ set(SKATE3_COMMON_SOURCES
     src/skate3_native_debug_dialog.cpp
     src/skate3_native_render.cpp
     src/skate3_native_scene.cpp
+    src/skate3_oob_watch.cpp
+    src/skate3_cosmetic_lock.cpp
     src/skate3_native_scene_gpu.cpp
+    src/skate3_native_scene_cosmetics.cpp
     src/skate3_native_scene_post.cpp
     src/skate3_screenshot.cpp
     src/skate3_shader_disasm.cpp
@@ -347,6 +350,7 @@ set(SKATE3_NATIVE_SHADER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/ssao.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/hdr.hlsl
     ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/ssr.hlsl
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/native/shaders/cosmetic.hlsl
 )
 # Shared .hlsli headers, inlined into the embedded sources by
 # EmbedShaders.cmake: the embed must rerun when any of them changes.

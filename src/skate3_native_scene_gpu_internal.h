@@ -1074,6 +1074,10 @@ void ApplyHdrPost(const NativeGuestOutputRenderContext& context,
                   uint64_t frame_number);
 bool ApplyMenuBlurPass(const NativeGuestOutputRenderContext& context, nrhi::Cmd* cmd,
                        float target_sigma, bool output_in_guest_output_state);
+// Head cosmetics (skate3_native_scene_cosmetics.cpp): the Tylenol bottle and
+// its contrail, drawn inside the scene pass at FrameScene::cosmetic_root.
+void RenderHeadCosmetics(const NativeGuestOutputRenderContext& context, nrhi::Cmd* cmd,
+                         const FrameScene& scene, uint64_t frame_number);
 // Blur-over-emulated-frames post processor registered by Install().
 void PostProcessGuestOutput(const NativeGuestOutputRenderContext& context,
                             void* user_data);

@@ -7,6 +7,7 @@
 // guest output texture via the SDK native-guest-output hook, replacing the
 // emulated frame when active.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -303,6 +304,11 @@ struct FrameScene {
   uint64_t generation = 0;
   float view_proj[16] = {};
   float cam_pos[3] = {};
+  // [cosmetics] Tylenol bottle anchors: world position of every marker item
+  // (the tiara) worn this frame, one per wearer; the tiara itself is hidden.
+  // Drawn by skate3_native_scene_cosmetics.cpp.
+  // xyz = position, [3]/[4] = world X/Z unit direction behind the skater's head.
+  std::vector<std::array<float, 5>> cosmetic_anchors;
   // Raw guest projection matrix (viewcam +0x60, row-vector, m23 = 1),
   // published alongside view_proj. Consumed by depth-based post passes
   // (SSAO linearize/unproject via m00/m11/m22/m32). Zeros until the first

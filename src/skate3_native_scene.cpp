@@ -98,6 +98,37 @@ REXCVAR_DEFINE_BOOL(skate3_net_real_skaters, false, "Net",
                     "(own model/board/animation), positioned at the remote's "
                     "net position, instead of the mesh clone. Off = clone path.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [rename] Show online freeskate as "Open.Roam" in the menus (see
+// RenameFreeskateThread; "Solo Freeskate" keeps its name).
+REXCVAR_DEFINE_BOOL(skate3_rename_freeskate, false, "Skate 3",
+                    "Show online freeskate as 'Open.Roam' in the menus by patching "
+                    "the decoded UI text in guest memory (same length).")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [open-roam] Shared with skate3_oob_watch.cpp: live player position + "in
+// world long enough" flag, published here each frame for the teleport filters.
+extern "C" float g_skate3_player_pos[3];
+extern "C" int g_skate3_player_pos_valid;
+extern "C" int g_skate3_player_live;
+REXCVAR_DECLARE(int32_t, skate3_oob_kill_mode);
+static bool g_oob_player_seen = false;          // skater world pos read this frame
+static uint32_t g_oob_player_live_frames = 0;   // frames in-world
+static uint32_t g_oob_player_miss_frames = 0;   // consecutive frames not seen
+// [ps-glyphs] Diagnostic: dump glyph-sized 2D texture decodes (RGBA + their
+// content fingerprint) to <launch>/glyph_dumps/, one per fingerprint, so the
+// Xbox button-prompt textures can be identified for the PS-glyph host-side swap.
+REXCVAR_DEFINE_BOOL(skate3_glyph_dump, false, "Skate 3",
+                    "Dump glyph-sized 2D texture decodes (RGBA) named by content "
+                    "fingerprint, to identify controller button prompts.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// [ps-glyphs] Show PlayStation button prompts in the Scaleform frontend: the
+// main 2D decode path hashes each 64x64 single-mip DXT5 texture's block rows
+// and, on a match with a known Xbox glyph (A/B/X/Y/LT/RT/dpad/Start), swaps
+// in a PS3 glyph re-encoded to BC3 (art from miscboot.big's PS3 set). Host-side
+// only; no game data is modified. See src/skate3_ps_glyphs.h (generated).
+REXCVAR_DEFINE_BOOL(skate3_glyph_swap, false, "Skate 3",
+                    "Replace Xbox button-prompt glyphs with PlayStation glyphs "
+                    "(cross/circle/square/triangle, L2/R2, PS d-pad) in the menus.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 // [skater-puppet] Proof-of-concept for driving a REAL game skater entity.
 // The game already spawns+animates a crowd of ambient AI skaters (each a real
 // SkaterPresEntity, own model + own animation, no EA backend). When on, this
@@ -9058,6 +9089,218 @@ static void RunTrickScan(uint8_t* base) {
   }
 }
 
+static uint64_t ItemAssetSignature(uint8_t* base, const DrawItem& item) {
+  uint64_t h = 1469598103934665603ull;
+  const auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+  mix(item.vb_bytes);
+  mix(item.ib_count);
+  mix(item.stride);
+  mix(item.pos_fmt);
+  for (int k = 0; k < 3; ++k) {
+    mix(uint64_t(int64_t(std::lround(item.bbox_min[k] * 1000.0f))));
+    mix(uint64_t(int64_t(std::lround(item.bbox_max[k] * 1000.0f))));
+  }
+  if (item.vb_bytes >= 8 && item.ib_count >= 4) {
+    for (uint32_t k = 0; k < 16; ++k) {
+      uint64_t vq = 0, iq = 0;
+      const uint32_t vb_off = uint32_t(uint64_t(item.vb_bytes - 8) * k / 15u) & ~7u;
+      const uint32_t ib_off = uint32_t(uint64_t(item.ib_count * 2 - 8) * k / 15u) & ~7u;
+      if (GuestTryLoadU64(base, item.vb_addr + vb_off, &vq)) mix(vq);
+      if (GuestTryLoadU64(base, item.ib_addr + ib_off, &iq)) mix(iq);
+    }
+  }
+  return h;
+}
+// [cosmetics] Marker item for the Tylenol bottle: the CAS tiara (second to
+// last hat). Native online syncs outfits, so every client sees who wears it;
+// matched by machine-independent content signature (ItemAssetSignature).
+static constexpr uint64_t kBottleMarkerSignature = 0xD0CD5681EE1E43D0ull;
+static constexpr uint32_t kBottleMarkerVbBytes = 19348;
+static constexpr uint32_t kBottleMarkerIbCount = 2454;
+// Bottle center sits this far behind the head center (over the neck).
+static constexpr float kBottleBackMeters = 0.06f;
+
+// Palette index (x12 floats) of the bone that drives the marker: the
+// highest-weight influence of its first vertex (the whole tiara rides the head).
+static int MarkerDominantBone(uint8_t* base, const DrawItem& item) {
+  uint64_t bw = 0, bi = 0;
+  if (!GuestTryLoadU64(base, item.vb_addr + item.bw_offset, &bw) ||
+      !GuestTryLoadU64(base, item.vb_addr + item.bi_offset, &bi)) {
+    return -1;
+  }
+  const uint32_t w = uint32_t(bw >> 32), idx = uint32_t(bi >> 32);
+  int best = -1, best_w = 0;
+  for (int k = 0; k < 4; ++k) {
+    const int wk = int((w >> (k * 8)) & 0xFF);
+    if (wk > best_w) { best_w = wk; best = int((idx >> (k * 8)) & 0xFF); }
+  }
+  return best;
+}
+
+static void CollectTylenolBottleAnchors(uint8_t* base, FrameScene& scene) {
+  scene.cosmetic_anchors.clear();
+  // fingerprint -> dominant bone (-1 = not the marker); fingerprints change
+  // when streaming moves a mesh, so the cache stays small and self-healing.
+  static std::unordered_map<uint64_t, int> s_marker_bone;
+  for (DrawItem& item : scene.items) {
+    if (!item.skinned || item.vb_bytes != kBottleMarkerVbBytes ||
+        item.ib_count != kBottleMarkerIbCount || item.draws.empty()) {
+      continue;
+    }
+    auto it = s_marker_bone.find(item.fingerprint);
+    if (it == s_marker_bone.end()) {
+      if (s_marker_bone.size() > 256) s_marker_bone.clear();
+      const int bone = ItemAssetSignature(base, item) == kBottleMarkerSignature
+                           ? MarkerDominantBone(base, item) : -1;
+      it = s_marker_bone.emplace(item.fingerprint, bone).first;
+    }
+    const int bone = it->second;
+    if (bone < 0 || size_t(bone + 1) * 12 > item.bones.size()) continue;
+    // Anchor = the middle of the head (11 cm below the tiara), nudged back over
+    // the neck, taken through the head bone so the bottle stays centered on the
+    // head when the skater leans. Model -Z = behind the skater.
+    constexpr float back_z = -1.0f;
+    const float c[3] = {(item.bbox_min[0] + item.bbox_max[0]) * 0.5f,
+                        (item.bbox_min[1] + item.bbox_max[1]) * 0.5f - 0.11f,
+                        (item.bbox_min[2] + item.bbox_max[2]) * 0.5f +
+                            back_z * kBottleBackMeters};
+    const float* r = &item.bones[size_t(bone) * 12];
+    // xyz = world position, [3]/[4] = world X/Z of the head's backward direction.
+    std::array<float, 5> world{};
+    for (int k = 0; k < 3; ++k) {
+      world[k] = r[k * 4] * c[0] + r[k * 4 + 1] * c[1] + r[k * 4 + 2] * c[2] + r[k * 4 + 3];
+    }
+    const float bx = r[2] * back_z, bz = r[10] * back_z;
+    const float bl = std::sqrt(bx * bx + bz * bz);
+    world[3] = bl > 1e-4f ? bx / bl : 0.0f;
+    world[4] = bl > 1e-4f ? bz / bl : -1.0f;
+    if (!(std::isfinite(world[0]) && std::isfinite(world[1]) && std::isfinite(world[2]) &&
+          std::isfinite(world[3]) && std::isfinite(world[4]))) {
+      continue;
+    }
+    scene.cosmetic_anchors.push_back(world);
+    item.draws.clear();  // hide the tiara: the bottle replaces it
+  }
+}
+// [rename] Background "Freeskate" -> "Open.Roam" text patcher (same length,
+// styled like the game's "skate.Park"; "Solo Freeskate" is kept). The menu text is
+// decoded from the compressed language files at run time, so it lives in heap
+// memory, not in the image. Every second this walks the committed guest pages
+// (skipping the XEX image, whose "Freeskate" strings are internal identifiers)
+// and rewrites whole-word "Freeskate" in ASCII and UTF-16 (LE/BE). "Whole
+// word" = not touching another letter on either side, so identifiers like
+// SoloFreeskate / FreeskateActivityOverlayHUD are left alone.
+namespace {
+bool IsAsciiLetter(uint8_t c) { return (c | 0x20) >= 'a' && (c | 0x20) <= 'z'; }
+
+void RenameFreeskateInRegion(uint8_t* p, size_t n, int* patched) {
+  static const uint8_t kFind[] = {'F', 'r', 'e', 'e', 's', 'k', 'a', 't', 'e'};
+  static const uint8_t kRepl[] = {'O', 'p', 'e', 'n', '.', 'R', 'o', 'a', 'm'};
+  for (int width = 1; width <= 2; ++width) {
+    const size_t len = 9u * width;
+    if (n < len + 2 * width) continue;
+    for (size_t i = width; i + len + width <= n;) {
+      uint8_t* hit = static_cast<uint8_t*>(std::memchr(p + i, 'F', n - len - width - i + 1));
+      if (hit == nullptr) break;
+      i = static_cast<size_t>(hit - p);
+      // Width 2: 'F' may be the high (BE, 0 before) or low (LE, 0 after) byte.
+      for (int be = 0; be <= (width == 2 ? 1 : 0); ++be) {
+        size_t s = (width == 2 && be) ? i - 1 : i;
+        if (s < static_cast<size_t>(width) || s + len + width > n) continue;
+        bool match = true;
+        for (int k = 0; k < 9 && match; ++k) {
+          if (width == 1) {
+            match = p[s + k] == kFind[k];
+          } else if (be) {
+            match = p[s + 2 * k] == 0 && p[s + 2 * k + 1] == kFind[k];
+          } else {
+            match = p[s + 2 * k] == kFind[k] && p[s + 2 * k + 1] == 0;
+          }
+        }
+        if (!match) continue;
+        const uint8_t before = width == 1 ? p[s - 1] : (be ? p[s - 1] : p[s - 2]);
+        const uint8_t before_hi = width == 1 ? 0 : (be ? p[s - 2] : p[s - 1]);
+        const uint8_t after = width == 1 ? p[s + len] : (be ? p[s + len + 1] : p[s + len]);
+        const uint8_t after_hi = width == 1 ? 0 : (be ? p[s + len] : p[s + len + 1]);
+        if ((before_hi == 0 && IsAsciiLetter(before)) || (after_hi == 0 && IsAsciiLetter(after)))
+          continue;
+        // Offline "Solo Freeskate" keeps its name.
+        if (s >= 5u * width) {
+          static const uint8_t kSolo[] = {'S', 'o', 'l', 'o', ' '};
+          bool solo = true;
+          for (int j = 0; j < 5 && solo; ++j) {
+            const size_t at = s - (5u - j) * width;
+            const uint8_t lo = width == 1 ? p[at] : (be ? p[at + 1] : p[at]);
+            const uint8_t hi = width == 1 ? 0 : (be ? p[at] : p[at + 1]);
+            solo = hi == 0 && lo == kSolo[j];
+          }
+          if (solo) continue;
+        }
+        for (int k = 0; k < 9; ++k) {
+          if (width == 1) {
+            p[s + k] = kRepl[k];
+          } else if (be) {
+            p[s + 2 * k + 1] = kRepl[k];
+          } else {
+            p[s + 2 * k] = kRepl[k];
+          }
+        }
+        ++*patched;
+      }
+      i += 1;
+    }
+  }
+}
+
+// SEH wrapper kept free of C++ objects (required for __try).
+void RenameFreeskateChunkGuarded(uint8_t* p, size_t n, int* patched) {
+  __try {
+    RenameFreeskateInRegion(p, n, patched);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
+
+void RenameFreeskateThread(uint8_t* base) {
+  constexpr uint64_t kLo = 0x00010000ull, kHi = 0x90000000ull;
+  constexpr uint64_t kImageLo = 0x82000000ull, kImageHi = 0x84000000ull;
+  uint64_t total = 0;
+  for (;;) {
+    int patched = 0;
+    uint64_t a = kLo;
+    while (a < kHi) {
+      if (a >= kImageLo && a < kImageHi) { a = kImageHi; continue; }
+      MEMORY_BASIC_INFORMATION info{};
+      if (VirtualQuery(base + a, &info, sizeof(info)) == 0) break;
+      const uint64_t region_end =
+          static_cast<uint64_t>(static_cast<uint8_t*>(info.BaseAddress) - base) + info.RegionSize;
+      uint64_t end = region_end < kHi ? region_end : kHi;
+      if (a < kImageLo && end > kImageLo) end = kImageLo;
+      const DWORD prot = info.Protect & 0xFF;
+      const bool rw = info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0 &&
+                      (prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE);
+      if (rw && end > a) {
+        // Chunked so a region that is decommitted mid-scan only loses a chunk.
+        for (uint64_t c = a; c < end; c += 0x100000ull) {
+          const uint64_t ce = (c + 0x100000ull + 32 < end) ? c + 0x100000ull + 32 : end;
+          RenameFreeskateChunkGuarded(base + c, static_cast<size_t>(ce - c), &patched);
+        }
+      }
+      a = end > a ? end : a + 0x1000ull;
+    }
+    if (patched > 0) {
+      total += static_cast<uint64_t>(patched);
+      REXLOG_INFO("[rename] Freeskate -> Open.Roam: {} new ({} total)", patched, total);
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+}
+
+void StartRenameFreeskateThread(uint8_t* base) {
+  static std::once_flag s_once;
+  std::call_once(s_once, [base] { std::thread(RenameFreeskateThread, base).detach(); });
+}
+}  // namespace
+
 void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   if (!SceneEnabled()) {
     return;
@@ -9071,7 +9314,24 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
   // guest base from the very first natively rendered boot frame.
   g_guest_base.store(base, std::memory_order_relaxed);
   ++g_guest_frame;  // paces the world-item cache revalidation
+  // [open-roam] "Player live" = the skater has been in-world ~15 s (900
+  // frames). Spawn placement uses the same teleport paths the Open Roam
+  // filters act on, so they stay off until then. A few missed frames (skater
+  // not in the draw list) don't reset it; only a long absence (a reload) does.
+  if (g_oob_player_seen) {
+    ++g_oob_player_live_frames;
+    g_oob_player_miss_frames = 0;
+  } else if (++g_oob_player_miss_frames > 300) {
+    g_oob_player_live_frames = 0;
+  }
+  g_oob_player_seen = false;
+  g_skate3_player_live = g_oob_player_live_frames > 900 ? 1 : 0;
   RunScoreScan(base);  // [score-scan] debug score-locator (idle unless cvar set)
+
+  // [rename] "Open.Roam": replace the "Freeskate" UI text with "Open.Roam"
+  // (same 9 characters). Runs on a background thread so it never costs frame
+  // time; see RenameFreeskateThread.
+  if (REXCVAR_GET(skate3_rename_freeskate)) StartRenameFreeskateThread(base);
   RunTrickScan(base);  // [trick-scan] debug current-trick-name locator
   RunAddrAutoscan(base, g_guest_frame);  // [addr-autoscan] background score+trick lock
   // Guest-input control layer (S.K.A.T.E. freeze + reset-to-marker injection).
@@ -10558,6 +10818,37 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       }
     }
 
+    // [open-roam] Publish the local player's world position every frame for
+    // the guest-thread teleport filters in skate3_oob_watch.cpp. The player
+    // is the skater-family entity owning the most draw items this frame.
+    if (REXCVAR_GET(skate3_oob_kill_mode) != 0) {
+      uint32_t pe = 0, pe_n = 0;
+      {
+        std::unordered_map<uint32_t, uint32_t> hist;
+        for (const DrawItem& item : scene.items) {
+          if (item.ctx == 0) continue;
+          skate3::native_entity::CtxInfo info;
+          if (!skate3::native_entity::LookupCtx(item.ctx, &info)) continue;
+          if (info.cls == skate3::native_entity::EntClass::kSkater ||
+              info.cls == skate3::native_entity::EntClass::kColorized ||
+              info.cls == skate3::native_entity::EntClass::kCac ||
+              info.cls == skate3::native_entity::EntClass::kSkaterAux) {
+            uint32_t& c = hist[info.entity];
+            if (++c > pe_n) { pe_n = c; pe = info.entity; }
+          }
+        }
+      }
+      float rows[12];
+      if (pe != 0 &&
+          skate3::native_entity::ReadEntityWorldRowsByEntity(base, pe, rows)) {
+        g_skate3_player_pos[0] = rows[3];
+        g_skate3_player_pos[1] = rows[7];
+        g_skate3_player_pos[2] = rows[11];
+        g_skate3_player_pos_valid = 1;
+        g_oob_player_seen = true;
+      }
+    }
+
     // [online play] Once-per-frame network bridge (opt-in; no-op when the net
     // system is inactive). Capture the local player's skater world transform
     // and publish it, then sample interpolated remote skaters for rendering.
@@ -11413,6 +11704,12 @@ void BuildFrameScene(uint8_t* base, const SubmitRecord* records, size_t count) {
       InterpolateDynamicItems(base, scene, now_s);
     }
   }
+
+  // [cosmetics] Tylenol bottle: every skater wearing the marker tiara gets the
+  // bottle at the tiara's skinned position; the tiara is hidden. Runs AFTER the
+  // pose smoothing so it uses the same (slightly delayed) palette the skater
+  // renders with; the raw newest pose made the bottle run ahead while moving.
+  CollectTylenolBottleAnchors(base, scene);
 
   // Hor+ ultrawide scale for this frame's camera (1.0 when the output is not
   // wide). The matrices are widened after the camera overrides below; the

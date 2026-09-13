@@ -46,3 +46,6 @@ TU_*
 /B13E*/
 # Stray GPU vendor cache folder
 /NVIDIA Corporation/
+
+# PlayStation button prompt art (derived from game assets; release zip only)
+src/skate3_ps_glyphs.h

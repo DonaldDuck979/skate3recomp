@@ -128,3 +128,112 @@ endforeach()
 if(NOT _demo_path_movie_patched)
   message(FATAL_ERROR "Failed to apply Skate 3 demo path intro movie patch; FEMoviePlayer::Update anchor not found")
 endif()
+
+# ---- Open Roam (full-map online freeskate) -------------------------------
+# Each patch inserts a call into src/skate3_oob_watch.cpp (declared in
+# skate3_open_roam_guest.h). The calls are no-ops unless skate3_oob_kill_mode
+# enables the feature. A patch is skipped if its marker is already present.
+function(_skate3_open_roam_patch _name _marker _anchor _replacement)
+  foreach(_file IN LISTS _skate3_recomp_files)
+    file(READ "${_file}" _contents)
+    string(FIND "${_contents}" "${_marker}" _marker_pos)
+    if(NOT _marker_pos EQUAL -1)
+      return()
+    endif()
+    string(FIND "${_contents}" "${_anchor}" _anchor_pos)
+    if(_anchor_pos EQUAL -1)
+      continue()
+    endif()
+    string(REPLACE "${_anchor}" "${_replacement}" _contents "${_contents}")
+    _skate3_add_include(_contents "skate3_open_roam_guest.h")
+    file(WRITE "${_file}" "${_contents}")
+    message(STATUS "Applied Open Roam patch '${_name}' in ${_file}")
+    return()
+  endforeach()
+  message(FATAL_ERROR "Failed to apply Open Roam patch '${_name}'; anchor not found")
+endfunction()
+
+# Collision streams around the player: streaming-channel focus setter
+# sub_8247C100, right before it tests the channel lock count (r11).
+_skate3_open_roam_patch("focus"
+  "Skate3OpenRoam_FocusUpdate(ctx, base);"
+"	// mr r11,r11
+	ctx.r11.u64 = ctx.r11.u64;
+	// cmplwi cr6,r11,0
+	ctx.cr6.compare<uint32_t>(ctx.r11.u32, 0, ctx.xer);
+	// beq cr6,0x8247c160"
+"	// mr r11,r11
+	ctx.r11.u64 = ctx.r11.u64;
+	Skate3OpenRoam_FocusUpdate(ctx, base);
+	// cmplwi cr6,r11,0
+	ctx.cr6.compare<uint32_t>(ctx.r11.u32, 0, ctx.xer);
+	// beq cr6,0x8247c160")
+
+# Sim_LocalPlayerStreamerController::Update (sub_8272AB80): skip its
+# online/game-state gates.
+_skate3_open_roam_patch("sim-update-gate"
+  "if (Skate3OpenRoam_SimFollow()) goto loc_8272ABB8;"
+"	ctx.lr = 0x8272AB90;
+	sub_82743FC0(ctx, base);
+"
+"	ctx.lr = 0x8272AB90;
+	sub_82743FC0(ctx, base);
+	if (Skate3OpenRoam_SimFollow()) goto loc_8272ABB8;
+")
+
+# sub_8285CDC0: create Sim_LocalPlayerStreamerController in online sessions
+# too (byte +323 of the session globals = online).
+_skate3_open_roam_patch("sim-controller"
+  "if (!ctx.cr6.eq && !Skate3OpenRoam_SimFollow()) goto loc_8285CE88;"
+"	// bne cr6,0x8285ce88
+	if (!ctx.cr6.eq) goto loc_8285CE88;
+	// lis r11,-31997"
+"	// bne cr6,0x8285ce88
+	if (!ctx.cr6.eq && !Skate3OpenRoam_SimFollow()) goto loc_8285CE88;
+	// lis r11,-31997")
+
+# sub_825DE4E0 (out-of-boundary message): skip showing ID_ONLINE_BOUNDARY_WARN.
+_skate3_open_roam_patch("boundary-warning"
+  "if (Skate3OpenRoam_HideAreaWarning()) goto loc_825DE718;"
+"loc_825DE670:
+"
+"loc_825DE670:
+	if (Skate3OpenRoam_HideAreaWarning()) goto loc_825DE718;
+")
+
+# sub_82D55710 (DisableSessionMarker): markers stay usable out of the area.
+_skate3_open_roam_patch("marker-disable"
+  "if (Skate3OpenRoam_IgnoreMarkerDisable(ctx, base)) return;"
+"DEFINE_REX_FUNC(sub_82D55710) {
+	REX_FUNC_PROLOGUE();
+	uint32_t ea{};
+"
+"DEFINE_REX_FUNC(sub_82D55710) {
+	REX_FUNC_PROLOGUE();
+	uint32_t ea{};
+	if (Skate3OpenRoam_IgnoreMarkerDisable(ctx, base)) return;
+")
+# ---- Cosmetics: character part sets (src/skate3_cosmetic_lock.cpp) ----------
+_skate3_open_roam_patch("set-part"
+  "if (Skate3Cosmetic_OnSetPart(ctx, base, 0)) return;"
+"DEFINE_REX_FUNC(sub_82DDEDB0) {
+	REX_FUNC_PROLOGUE();
+	uint32_t ea{};
+"
+"DEFINE_REX_FUNC(sub_82DDEDB0) {
+	REX_FUNC_PROLOGUE();
+	uint32_t ea{};
+	if (Skate3Cosmetic_OnSetPart(ctx, base, 0)) return;
+")
+
+_skate3_open_roam_patch("swap-part"
+  "Skate3Cosmetic_OnSetPart(ctx, base, 1);"
+"DEFINE_REX_FUNC(sub_82DDEEF8) {
+	REX_FUNC_PROLOGUE();
+	uint32_t ea{};
+"
+"DEFINE_REX_FUNC(sub_82DDEEF8) {
+	REX_FUNC_PROLOGUE();
+	uint32_t ea{};
+	Skate3Cosmetic_OnSetPart(ctx, base, 1);
+")

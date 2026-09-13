@@ -6,6 +6,7 @@
 #include "skate3_iso_installer.h"
 #include "skate3_native_render.h"
 #include "skate3_native_scene.h"
+#include "skate3_oob_watch.h"
 #include "skate3_screenshot.h"
 #include "skate3_shader_disasm.h"
 #include "skate3_win_icon.h"
@@ -800,6 +801,7 @@ void Skate3BaseApp::OnPostSetup() {
   auto* dispatcher = runtime()->function_dispatcher();
   skate3::native_render::Install();
   skate3::demo_path::InstallHooks(dispatcher);
+  skate3::oob_watch::InstallKillHook(dispatcher);
   // User-facing intro-movie skip (independent of the demo path): the movie
   // completion override polls the merged UI pad state through this provider.
   skate3::demo_path::SetUiInputProvider([this]() {

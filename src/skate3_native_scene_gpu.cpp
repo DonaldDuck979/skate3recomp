@@ -166,6 +166,24 @@ REXCVAR_DECLARE(int32_t, skate3_native_render_scene_warmup_min_items);
 REXCVAR_DECLARE(std::string, skate3_native_render_scene_trace_mesh);
 REXCVAR_DECLARE(std::string, skate3_native_render_scene_trace_2d);
 REXCVAR_DECLARE(std::string, skate3_native_render_snapshot_dir);
+REXCVAR_DECLARE(bool, skate3_glyph_dump);
+REXCVAR_DECLARE(bool, skate3_glyph_swap);
+// [ps-glyphs] Replacement BC3 payloads, generated locally from the PS3 glyph
+// art in the user's own miscboot.big. The generated header is not distributed
+// (game-derived art); without it the swap has nothing to replace.
+#if __has_include("skate3_ps_glyphs.h")
+#include "skate3_ps_glyphs.h"
+#else
+namespace skate3::ps_glyphs {
+struct Entry {
+  uint64_t hash;
+  const char* name;
+  const uint8_t* bc3;
+};
+static const Entry* const kEntries = nullptr;
+static const size_t kEntryCount = 0;
+}  // namespace skate3::ps_glyphs
+#endif
 
 #if (defined(REX_HAS_D3D12) && REX_HAS_D3D12) || (defined(REX_HAS_VULKAN) && REX_HAS_VULKAN)
 
@@ -1578,6 +1596,31 @@ bool UploadGeneratedMips(const NativeGuestOutputRenderContext& context, uint8_t*
   out.near_black = SampleProbeNearBlack(base, out);
   out.recheck_frame = 0;
   out.valid = g_tex_stage_out == nullptr;  // staged: live only after commit
+
+  // [ps-glyphs] Identification dump: glyph-sized decodes (button prompts are
+  // ~40x30 8888 no-mip), one file per content fingerprint, so each Xbox glyph
+  // can be matched to a PlayStation replacement for the host-side swap.
+  if (REXCVAR_GET(skate3_glyph_dump) && !mips.empty() && width >= 12 &&
+      width <= 96 && height >= 12 && height <= 96) {
+    static std::mutex s_gm;
+    static std::unordered_set<uint64_t> s_seen;
+    bool fresh = false;
+    {
+      std::lock_guard<std::mutex> lk(s_gm);
+      fresh = s_seen.insert(out.payload_fp).second;
+    }
+    if (fresh) {
+      std::error_code ec;
+      std::filesystem::create_directories("glyph_dumps", ec);
+      char path[260];
+      std::snprintf(path, sizeof(path), "glyph_dumps/g_%016llX_%ux%u.rgba",
+                    static_cast<unsigned long long>(out.payload_fp), width, height);
+      if (FILE* f = std::fopen(path, "wb")) {
+        std::fwrite(mips[0].data(), 1, mips[0].size(), f);
+        std::fclose(f);
+      }
+    }
+  }
   return true;
 }
 
@@ -1959,6 +2002,42 @@ bool EnsureGuestTextureFromWords(const NativeGuestOutputRenderContext& context,
                     size_t(p0.cols) * bytes_per_block, f);
       }
       std::fclose(f);
+    }
+  }
+
+  // [ps-glyphs] PlayStation button prompts. The Scaleform frontend's Xbox
+  // glyphs (A/B/X/Y/LT/RT/dpad/Start) are standalone 64x64 single-mip DXT5
+  // textures through this path. Hash the untiled mip-0 block rows (the exact
+  // bytes the .blk diagnostic dump writes) and, on a known-glyph match, overwrite
+  // them in the upload mapping with the PS3 replacement BC3 blocks before the
+  // copy is recorded. Same format/layout, so nothing else in the pipeline
+  // changes; the words-keyed cache then serves the PS glyph for that texture.
+  if (mip_count == 1 && width == 64 && height == 64 && uint32_t(info.format) == 20u &&
+      REXCVAR_GET(skate3_glyph_swap)) {
+    const MipPlan& p0 = plans[0];
+    const size_t row_len = size_t(p0.cols) * bytes_per_block;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t by = 0; by < p0.rows; ++by) {
+      const uint8_t* row = mapping + p0.offset + size_t(by) * p0.pitch;
+      for (size_t i = 0; i < row_len; ++i) {
+        h = (h ^ row[i]) * 0x100000001b3ull;
+      }
+    }
+    for (size_t e = 0; e < skate3::ps_glyphs::kEntryCount; ++e) {
+      const skate3::ps_glyphs::Entry& ent = skate3::ps_glyphs::kEntries[e];
+      if (ent.hash != h) continue;
+      if (row_len * p0.rows == 4096) {
+        for (uint32_t by = 0; by < p0.rows; ++by) {
+          std::memcpy(mapping + p0.offset + size_t(by) * p0.pitch,
+                      ent.bc3 + size_t(by) * row_len, row_len);
+        }
+        static std::atomic<uint32_t> s_swaps{0};
+        if (s_swaps.fetch_add(1, std::memory_order_relaxed) < 32) {
+          REXLOG_INFO("[ps-glyphs] swapped {} (hash {:016X}, base {:08X})", ent.name, h,
+                      info.memory.base_address);
+        }
+      }
+      break;
     }
   }
   device->Unmap(out.upload);
@@ -10387,6 +10466,10 @@ bool RenderScene(const NativeGuestOutputRenderContext& context, void* /*user_dat
       ++drawn_spline;
     }
   }
+
+  // Head cosmetics (the Tylenol bottle + contrail), depth-tested like the
+  // splines above.
+  RenderHeadCosmetics(context, cmd, scene, frame_number);
 
   const bool outline_ready =
       RenderOutlineMask(context, scene, viewport, scissor, msaa_on, scene_color,
