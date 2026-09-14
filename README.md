@@ -103,10 +103,6 @@ using the game's own online freeskate:
 
 - No snap-back and no leaving-area warning — skate the whole district.
 - Collision streams around you everywhere, like offline freeskate.
-- Bails respawn where you fell instead of back in the play area.
-- Session markers work anywhere: **LB + D-pad Down** sets a marker (even out of
-  the old area), **LB + D-pad Up** returns to it.
-- The camera snaps back to your skater after teleports.
 - The menus call online freeskate "Open.Roam" (offline "Solo Freeskate" keeps
   its name).
 
